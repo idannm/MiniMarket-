@@ -1,4 +1,5 @@
-streamlit
+flask
+gunicorn
 groq
 psycopg2-binary
 pandas
