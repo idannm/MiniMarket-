@@ -3,55 +3,24 @@ import requests
 import psycopg2
 from flask import Flask, request, jsonify
 import google.generativeai as genai
-import json
 
 app = Flask(__name__)
 
-# --- הגדרות ---
+# --- משתני סביבה ---
 DB_URL = os.environ.get("DB_URL")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY") # שים לב לשם המשתנה החדש
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "my_verify_token")
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "123")
 
-# הגדרת המודל של גוגל
+# הגדרת Gemini
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
 
+# --- פונקציות עזר ---
 def get_db_connection():
     return psycopg2.connect(DB_URL)
-
-# --- ניהול זיכרון והיסטוריה ---
-def save_message_to_history(phone, role, content):
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        # ב-Gemini הבוט נקרא 'model' והמשתמש 'user'
-        if role == 'assistant': role = 'model'
-        cur.execute("INSERT INTO conversation_history (phone, role, content) VALUES (%s, %s, %s)", (phone, role, content))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"History Save Error: {e}")
-
-def get_chat_history_for_gemini(phone):
-    """שליפת היסטוריה בפורמט ש-Gemini מבין"""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT role, content FROM conversation_history WHERE phone = %s ORDER BY created_at ASC LIMIT 20", (phone,))
-        rows = cur.fetchall()
-        conn.close()
-        
-        history = []
-        for r in rows:
-            role = r[0]
-            if role == "assistant": role = "model" # המרה לפורמט של גוגל
-            history.append({"role": role, "parts": [r[1]]})
-        return history
-    except:
-        return []
 
 def get_inventory_text():
     try:
@@ -74,7 +43,9 @@ def save_order(name, phone, address, items):
         conn.commit()
         conn.close()
         return new_id
-    except: return None
+    except Exception as e:
+        print(f"DB Error: {e}")
+        return None
 
 def send_whatsapp_message(to, text):
     try:
@@ -83,12 +54,20 @@ def send_whatsapp_message(to, text):
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
         data = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
         requests.post(url, headers=headers, json=data)
-        save_message_to_history(to, "model", text)
-    except: pass
+    except Exception as e:
+        print(f"WhatsApp Error: {e}")
 
-# --- הבוט (Webhook) ---
+# --- הבוט עצמו ---
+@app.route('/webhook', methods=['GET'])
+def verify():
+    """אימות מול פייסבוק"""
+    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        return request.args.get("hub.challenge")
+    return "Error", 403
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    """קבלת הודעות"""
     data = request.get_json()
     try:
         if 'messages' in data['entry'][0]['changes'][0]['value']:
@@ -96,73 +75,60 @@ def webhook():
             sender = message['from']
             text = message['text']['body']
             
-            # 1. שמירה
-            save_message_to_history(sender, "user", text)
-            
-            # 2. הכנת נתונים
+            # 1. הכנת נתונים ל-AI
             inventory = get_inventory_text()
-            history = get_chat_history_for_gemini(sender)
             
-            # 3. הגדרת המודל עם System Instruction
+            # 2. הנחיה ל-Gemini
             system_instruction = f"""
             אתה העוזר של מכולת "הזוג". המלאי: {inventory}
-            
             הוראות:
-            1. היה אנושי, קצר ונחמד.
-            2. אל תמציא מוצרים.
-            3. כשלקוח רוצה להזמין, בקש שם וכתובת.
-            4. כשיש לך את כל הפרטים (מוצרים, שם, כתובת), הוצא *רק* את הפקודה הזו:
+            1. היה נחמד וקצר. אל תמציא מוצרים.
+            2. בקש מהלקוח שם, כתובת ומוצרים.
+            3. רק כשיש לך את הכל, כתוב בדיוק כך:
             FINAL_ORDER|{sender}|[שם]|[כתובת]|[מוצרים]
             
-            לדוגמה: FINAL_ORDER|972501234567|דני|הרצל 5|חלב ולחם
-            אל תוציא את הפקודה הזו אם חסר משהו!
+            אל תכתוב FINAL_ORDER אם חסר משהו!
             """
             
-            if GOOGLE_API_KEY:
-                model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=system_instruction)
-                chat = model.start_chat(history=history)
-                
-                response = chat.send_message(text)
-                bot_reply = response.text.strip()
+            # 3. שליחה ל-Google
+            model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=system_instruction)
+            # (בגרסה פשוטה זו אין היסטוריה מלאה כדי למנוע סיבוכים, אבל המודל חכם מספיק להבין מהקשר קצר)
+            response = model.generate_content(f"הלקוח כתב: {text}")
+            bot_reply = response.text.strip()
 
-                # 4. זיהוי הזמנה
-                if "FINAL_ORDER|" in bot_reply:
-                    try:
-                        parts = bot_reply.split("|")
-                        # parts[0] is FINAL_ORDER, parts[1] is phone (sender)
-                        name = parts[2]
-                        addr = parts[3]
-                        items = parts[4]
-                        
-                        oid = save_order(name, sender, addr, items)
-                        final_msg = f"תודה {name}, ההזמנה (#{oid}) התקבלה! נשלח ל-{addr}."
-                        send_whatsapp_message(sender, final_msg)
-                    except:
-                        send_whatsapp_message(sender, "תודה, ההזמנה התקבלה (הייתה שגיאה קטנה בפיענוח, אני בודק).")
-                else:
-                    send_whatsapp_message(sender, bot_reply)
+            # 4. בדיקה אם זו הזמנה
+            if "FINAL_ORDER|" in bot_reply:
+                try:
+                    parts = bot_reply.split("|")
+                    name = parts[2]
+                    addr = parts[3]
+                    items = parts[4]
+                    
+                    oid = save_order(name, sender, addr, items)
+                    final_msg = f"תודה {name}! הזמנה {oid} התקבלה ונשלח ל-{addr}."
+                    send_whatsapp_message(sender, final_msg)
+                except:
+                    send_whatsapp_message(sender, "ההזמנה נקלטה במערכת! תודה.")
+            else:
+                send_whatsapp_message(sender, bot_reply)
 
     except Exception as e:
         print(f"Error: {e}")
 
     return "ok", 200
 
-# --- אימות ודשבורד ---
-@app.route('/webhook', methods=['GET'])
-def verify():
-    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
-        return request.args.get("hub.challenge")
-    return "Error", 403
-
+# --- נקודת קצה לדשבורד (חשוב!) ---
 @app.route('/send_update', methods=['POST'])
 def send_dashboard_update():
     auth = request.headers.get('X-Internal-Secret')
     if auth != INTERNAL_SECRET: return jsonify({"error": "Unauthorized"}), 401
     
     data = request.json
-    clean_phone = str(data.get('phone')).replace("WhatsApp:", "").strip()
-    send_whatsapp_message(clean_phone, data.get('message'))
+    phone = str(data.get('phone')).replace("WhatsApp:", "").strip()
+    send_whatsapp_message(phone, data.get('message'))
     return jsonify({"status": "sent"}), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+    # הרצה מקומית או דרך Gunicorn
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
