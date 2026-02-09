@@ -20,6 +20,30 @@ client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 def get_db_connection():
     return psycopg2.connect(DB_URL)
 
+# --- פונקציה חדשה למניעת כפילויות ---
+def is_message_processed(message_id):
+    """בודק אם ההודעה כבר טופלה בעבר. אם לא - רושם אותה."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # בדיקה אם קיים
+        cur.execute("SELECT 1 FROM processed_messages WHERE message_id = %s", (message_id,))
+        exists = cur.fetchone()
+        
+        if exists:
+            conn.close()
+            return True # ההודעה כבר טופלה!
+            
+        # אם לא קיים - נרשום אותה
+        cur.execute("INSERT INTO processed_messages (message_id) VALUES (%s)", (message_id,))
+        conn.commit()
+        conn.close()
+        return False # הודעה חדשה, אפשר לטפל בה
+    except Exception as e:
+        print(f"Deduplication Error: {e}")
+        return False # במקרה של שגיאה, ננסה לענות בכל זאת
+
 def save_message(phone, role, content):
     try:
         conn = get_db_connection()
@@ -54,7 +78,7 @@ def save_order(name, phone, address, items, original_sender_id):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # טריק חשוב: אנחנו שומרים את ה-ID המקורי של וואטסאפ בתוך הכתובת כדי שלא ילך לאיבוד
+        # שומרים את ה-ID המקורי בתוך הכתובת כדי שנוכל לחזור אליו מהדשבורד
         final_address = f"{address} | WA_ID:{original_sender_id}"
         
         cur.execute("INSERT INTO orders (customer_name, items, status, total_price, address) VALUES (%s, %s, %s, %s, %s) RETURNING id",
@@ -76,8 +100,6 @@ def send_whatsapp(to, text):
         r = requests.post(url, headers=headers, json=data)
         if r.status_code == 200:
             save_message(to, "assistant", text)
-        else:
-            print(f"WhatsApp Fail: {r.text}")
     except: pass
 
 @app.route('/webhook', methods=['POST'])
@@ -86,24 +108,29 @@ def webhook():
     try:
         if 'messages' in data['entry'][0]['changes'][0]['value']:
             msg = data['entry'][0]['changes'][0]['value']['messages'][0]
-            sender = msg['from'] # זה המספר האמיתי שצריך לשמור!
+            msg_id = msg['id'] # המזהה הייחודי של ההודעה
+            sender = msg['from']
             text = msg['text']['body']
             
+            # --- תיקון קריטי: בדיקת כפילויות ---
+            if is_message_processed(msg_id):
+                print(f"Duplicate message ignored: {msg_id}")
+                return "ok", 200 # מחזירים אישור לוואטסאפ אבל לא עושים כלום
+            
+            # מכאן ממשיכים רגיל רק אם ההודעה חדשה
             save_message(sender, "user", text)
             history = get_history(sender)
             inventory = get_inventory()
             
-            # --- ההנחיה החדשה והחכמה ---
             system_prompt = f"""
             אתה "בוטי", המוכר במכולת. המלאי: {inventory}
             
-            חוקים קריטיים:
-            1. אם הלקוח שואל "מה הזמנתי?" או "מה המצב?", תסתכל בהיסטוריה ותענה לו בעברית רגילה. **אל** תיצור הזמנה חדשה.
-            2. פקודת סגירת הזמנה (FINAL_ORDER) תוציא **רק** אם הלקוח אמר במפורש: "תזמין לי", "אני רוצה את זה", "סגור הזמנה".
-            3. כשאתה מוציא פקודה, הפורמט הוא:
+            חוקים:
+            1. אם הלקוח שואל שאלות כלליות ("מה הזמנתי?", "מה קורה?") - תענה רגיל. אל תיצור הזמנה.
+            2. רק אם הלקוח מבקש במפורש לקנות ("תזמין לי", "אני רוצה", "סגור הזמנה"), תוציא את הפקודה:
             FINAL_ORDER|{sender}|[שם]|[כתובת]|[מוצרים]
             
-            אל תכתוב FINAL_ORDER סתם! רק לפעולה של קנייה חדשה.
+            אל תכתוב FINAL_ORDER סתם.
             """
             
             if client:
@@ -114,7 +141,7 @@ def webhook():
                 )
                 bot_reply = completion.choices[0].message.content.strip()
                 
-                # זיהוי הזמנה
+                # בדיקה אם זו הזמנה אמיתית (ולא סתם שאלה)
                 if "FINAL_ORDER|" in bot_reply and not "מה הזמנתי" in text:
                     try:
                         parts = bot_reply.split("|")
@@ -122,16 +149,14 @@ def webhook():
                         addr = parts[3]
                         items = parts[4]
                         
-                        # שולחים את sender המקורי לשמירה
                         oid = save_order(name, sender, addr, items, sender)
-                        
-                        final_msg = f"תודה {name}, הזמנה #{oid} נקלטה וממתינה לאישור מנהל! ⏳\n(פרטי ההזמנה: {items} לכתובת {addr})"
+                        final_msg = f"תודה {name}, הזמנה #{oid} הועברה לאישור המנהל! ⏳\n(פרטים: {items} לכתובת {addr})"
                         send_whatsapp(sender, final_msg)
                     except:
-                        send_whatsapp(sender, "ההזמנה נקלטה וממתינה לאישור!")
+                        send_whatsapp(sender, "ההזמנה נקלטה וממתינה לאישור.")
                 else:
-                    # תשובה רגילה (בלי ליצור הזמנה)
-                    clean_reply = bot_reply.replace("FINAL_ORDER", "").split("|")[-1] # ניקוי למקרה חירום
+                    # מנקים שאריות אם הבוט התבלבל
+                    clean_reply = bot_reply.replace("FINAL_ORDER", "").split("|")[-1]
                     send_whatsapp(sender, clean_reply)
                     
     except Exception as e: print(f"Error: {e}")
@@ -149,7 +174,6 @@ def send_update():
     
     data = request.json
     phone = str(data.get('phone')).strip()
-    # כאן אנחנו סומכים שהדשבורד שלח מספר נקי
     send_whatsapp(phone, data.get('message'))
     return jsonify({"status": "sent"}), 200
 
