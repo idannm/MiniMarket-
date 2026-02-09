@@ -7,7 +7,7 @@ import json
 
 app = Flask(__name__)
 
-# --- הגדרות משתנים ---
+# --- הגדרות ---
 DB_URL = os.environ.get("DB_URL")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
@@ -15,15 +15,12 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "my_verify_token")
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "123")
 
-# חיבור ל-Groq
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# --- פונקציות עזר למסד הנתונים ---
 def get_db_connection():
     return psycopg2.connect(DB_URL)
 
 def save_message(phone, role, content):
-    """שמירת הודעה בהיסטוריה"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -33,18 +30,16 @@ def save_message(phone, role, content):
     except: pass
 
 def get_history(phone):
-    """שליפת היסטוריית שיחה"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT role, content FROM conversation_history WHERE phone = %s ORDER BY created_at DESC LIMIT 15", (phone,))
+        cur.execute("SELECT role, content FROM conversation_history WHERE phone = %s ORDER BY created_at DESC LIMIT 10", (phone,))
         rows = cur.fetchall()
         conn.close()
         return [{"role": r[0], "content": r[1]} for r in rows][::-1]
     except: return []
 
 def get_inventory():
-    """שליפת מוצרים זמינים"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -52,61 +47,63 @@ def get_inventory():
         items = cur.fetchall()
         conn.close()
         if items: return ", ".join([f"{i[0]} ({i[1]}₪)" for i in items])
-        return "אין סחורה כרגע"
-    except: return "שגיאה בטעינת מלאי"
+        return "אין סחורה"
+    except: return "שגיאה בטעינה"
 
-def save_order(name, phone, address, items):
-    """שמירת הזמנה חדשה (בסטטוס ממתין)"""
+def save_order(name, phone, address, items, original_sender_id):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # שים לב: הסטטוס הוא 'ממתין לאישור'
+        # טריק חשוב: אנחנו שומרים את ה-ID המקורי של וואטסאפ בתוך הכתובת כדי שלא ילך לאיבוד
+        final_address = f"{address} | WA_ID:{original_sender_id}"
+        
         cur.execute("INSERT INTO orders (customer_name, items, status, total_price, address) VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                    (name, items, 'ממתין לאישור', 0, f"{address} | טלפון: {phone}"))
+                    (name, items, 'ממתין לאישור', 0, final_address))
         new_id = cur.fetchone()[0]
         conn.commit()
         conn.close()
         return new_id
-    except: return None
+    except Exception as e:
+        print(f"Save Error: {e}")
+        return None
 
 def send_whatsapp(to, text):
-    """שליחת הודעה לוואטסאפ"""
     try:
         if to.startswith("0"): to = "972" + to[1:]
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
         data = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
-        requests.post(url, headers=headers, json=data)
-        save_message(to, "assistant", text)
+        r = requests.post(url, headers=headers, json=data)
+        if r.status_code == 200:
+            save_message(to, "assistant", text)
+        else:
+            print(f"WhatsApp Fail: {r.text}")
     except: pass
 
-# --- הבוט (Webhook) ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json()
     try:
         if 'messages' in data['entry'][0]['changes'][0]['value']:
             msg = data['entry'][0]['changes'][0]['value']['messages'][0]
-            sender = msg['from']
+            sender = msg['from'] # זה המספר האמיתי שצריך לשמור!
             text = msg['text']['body']
             
-            # 1. שמירה וטעינת הקשר
             save_message(sender, "user", text)
             history = get_history(sender)
             inventory = get_inventory()
             
-            # 2. המוח של הבוט
+            # --- ההנחיה החדשה והחכמה ---
             system_prompt = f"""
-            אתה "בוטי", המוכר במכולת "הזוג".
-            המלאי הקיים: {inventory}
+            אתה "בוטי", המוכר במכולת. המלאי: {inventory}
             
-            הוראות:
-            1. היה נחמד, קצר וענייני. דבר עברית בלבד.
-            2. המטרה שלך: להבין מה הלקוח רוצה, ואז לבקש שם וכתובת למשלוח.
-            3. כשלקוח נותן את כל הפרטים (מוצרים, שם, כתובת), שלח את הפקודה:
-            FINAL_ORDER|{sender}|[שם]|[כתובת]|[רשימת מוצרים]
+            חוקים קריטיים:
+            1. אם הלקוח שואל "מה הזמנתי?" או "מה המצב?", תסתכל בהיסטוריה ותענה לו בעברית רגילה. **אל** תיצור הזמנה חדשה.
+            2. פקודת סגירת הזמנה (FINAL_ORDER) תוציא **רק** אם הלקוח אמר במפורש: "תזמין לי", "אני רוצה את זה", "סגור הזמנה".
+            3. כשאתה מוציא פקודה, הפורמט הוא:
+            FINAL_ORDER|{sender}|[שם]|[כתובת]|[מוצרים]
             
-            אם חסר משהו, תשאל את הלקוח. אל תמציא פרטים.
+            אל תכתוב FINAL_ORDER סתם! רק לפעולה של קנייה חדשה.
             """
             
             if client:
@@ -117,45 +114,42 @@ def webhook():
                 )
                 bot_reply = completion.choices[0].message.content.strip()
                 
-                # 3. זיהוי הזמנה
-                if "FINAL_ORDER|" in bot_reply:
+                # זיהוי הזמנה
+                if "FINAL_ORDER|" in bot_reply and not "מה הזמנתי" in text:
                     try:
                         parts = bot_reply.split("|")
                         name = parts[2]
                         addr = parts[3]
                         items = parts[4]
                         
-                        oid = save_order(name, sender, addr, items)
+                        # שולחים את sender המקורי לשמירה
+                        oid = save_order(name, sender, addr, items, sender)
                         
-                        # --- השינוי שביקשת: הודעה על המתנה לאישור ---
-                        final_msg = f"תודה {name}! ההזמנה (#{oid}) נקלטה במערכת.\nהיא הועברה לאישור המנהל, נעדכן אותך בוואטסאפ ברגע שתאושר (כולל זמן הגעה)! ⏳"
-                        
+                        final_msg = f"תודה {name}, הזמנה #{oid} נקלטה וממתינה לאישור מנהל! ⏳\n(פרטי ההזמנה: {items} לכתובת {addr})"
                         send_whatsapp(sender, final_msg)
                     except:
                         send_whatsapp(sender, "ההזמנה נקלטה וממתינה לאישור!")
                 else:
-                    send_whatsapp(sender, bot_reply)
+                    # תשובה רגילה (בלי ליצור הזמנה)
+                    clean_reply = bot_reply.replace("FINAL_ORDER", "").split("|")[-1] # ניקוי למקרה חירום
+                    send_whatsapp(sender, clean_reply)
                     
-    except Exception as e:
-        print(f"Error: {e}")
-
+    except Exception as e: print(f"Error: {e}")
     return "ok", 200
 
-# --- אימות וחיבור לדשבורד ---
 @app.route('/webhook', methods=['GET'])
 def verify():
-    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
-        return request.args.get("hub.challenge")
+    if request.args.get("hub.verify_token") == VERIFY_TOKEN: return request.args.get("hub.challenge")
     return "Error", 403
 
 @app.route('/send_update', methods=['POST'])
 def send_update():
-    # אבטחה: רק הדשבורד יכול לשלוח הודעות דרך כאן
     auth = request.headers.get('X-Internal-Secret')
     if auth != INTERNAL_SECRET: return jsonify({"error": "Unauthorized"}), 401
     
     data = request.json
-    phone = str(data.get('phone')).replace("WhatsApp:", "").strip()
+    phone = str(data.get('phone')).strip()
+    # כאן אנחנו סומכים שהדשבורד שלח מספר נקי
     send_whatsapp(phone, data.get('message'))
     return jsonify({"status": "sent"}), 200
 
