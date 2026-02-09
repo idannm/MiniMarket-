@@ -6,7 +6,7 @@ import google.generativeai as genai
 
 app = Flask(__name__)
 
-# --- משתני סביבה ---
+# --- הגדרות ---
 DB_URL = os.environ.get("DB_URL")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
@@ -14,11 +14,10 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "my_verify_token")
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "123")
 
-# הגדרת Gemini
+# חיבור ל-Gemini
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
 
-# --- פונקציות עזר ---
 def get_db_connection():
     return psycopg2.connect(DB_URL)
 
@@ -43,9 +42,7 @@ def save_order(name, phone, address, items):
         conn.commit()
         conn.close()
         return new_id
-    except Exception as e:
-        print(f"DB Error: {e}")
-        return None
+    except: return None
 
 def send_whatsapp_message(to, text):
     try:
@@ -54,20 +51,11 @@ def send_whatsapp_message(to, text):
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
         data = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
         requests.post(url, headers=headers, json=data)
-    except Exception as e:
-        print(f"WhatsApp Error: {e}")
+    except: pass
 
-# --- הבוט עצמו ---
-@app.route('/webhook', methods=['GET'])
-def verify():
-    """אימות מול פייסבוק"""
-    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
-        return request.args.get("hub.challenge")
-    return "Error", 403
-
+# --- הבוט ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """קבלת הודעות"""
     data = request.get_json()
     try:
         if 'messages' in data['entry'][0]['changes'][0]['value']:
@@ -75,25 +63,26 @@ def webhook():
             sender = message['from']
             text = message['text']['body']
             
-            # 1. הכנת נתונים ל-AI
+            # 1. שליפת מלאי
             inventory = get_inventory_text()
             
-            # 2. הנחיה ל-Gemini
-            system_instruction = f"""
-            אתה העוזר של מכולת "הזוג". המלאי: {inventory}
-            הוראות:
-            1. היה נחמד וקצר. אל תמציא מוצרים.
-            2. בקש מהלקוח שם, כתובת ומוצרים.
-            3. רק כשיש לך את הכל, כתוב בדיוק כך:
-            FINAL_ORDER|{sender}|[שם]|[כתובת]|[מוצרים]
-            
-            אל תכתוב FINAL_ORDER אם חסר משהו!
+            # 2. בניית ההנחיה (Prompt) - הכל ביחד כדי למנוע שגיאות גרסה
+            full_prompt = f"""
+            אתה העוזר החכם של מכולת "הזוג".
+            המלאי הקיים בחנות: {inventory}
+
+            הוראות ברזל:
+            1. ענה קצר ולעניין בעברית. אל תמציא מוצרים שלא במלאי.
+            2. שאל את הלקוח מה הוא רוצה, ומה שמו וכתובתו.
+            3. רק כאשר יש לך את כל הפרטים (מוצרים, שם, כתובת), כתוב את השורה הבאה בלבד:
+            FINAL_ORDER|{sender}|[שם]|[כתובת]|[רשימת מוצרים]
+
+            הודעת הלקוח עכשיו: {text}
             """
             
-            # 3. שליחה ל-Google
-            model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=system_instruction)
-            # (בגרסה פשוטה זו אין היסטוריה מלאה כדי למנוע סיבוכים, אבל המודל חכם מספיק להבין מהקשר קצר)
-            response = model.generate_content(f"הלקוח כתב: {text}")
+            # 3. שימוש ב-gemini-pro (המודל הכי יציב שעובד תמיד)
+            model = genai.GenerativeModel('gemini-pro')
+            response = model.generate_content(full_prompt)
             bot_reply = response.text.strip()
 
             # 4. בדיקה אם זו הזמנה
@@ -105,10 +94,9 @@ def webhook():
                     items = parts[4]
                     
                     oid = save_order(name, sender, addr, items)
-                    final_msg = f"תודה {name}! הזמנה {oid} התקבלה ונשלח ל-{addr}."
-                    send_whatsapp_message(sender, final_msg)
+                    send_whatsapp_message(sender, f"תודה {name}! הזמנה {oid} נקלטה ונשלח ל-{addr}.")
                 except:
-                    send_whatsapp_message(sender, "ההזמנה נקלטה במערכת! תודה.")
+                    send_whatsapp_message(sender, "ההזמנה נקלטה במערכת, תודה!")
             else:
                 send_whatsapp_message(sender, bot_reply)
 
@@ -117,7 +105,14 @@ def webhook():
 
     return "ok", 200
 
-# --- נקודת קצה לדשבורד (חשוב!) ---
+# --- אימות ---
+@app.route('/webhook', methods=['GET'])
+def verify():
+    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        return request.args.get("hub.challenge")
+    return "Error", 403
+
+# --- חיבור לדשבורד ---
 @app.route('/send_update', methods=['POST'])
 def send_dashboard_update():
     auth = request.headers.get('X-Internal-Secret')
@@ -129,6 +124,5 @@ def send_dashboard_update():
     return jsonify({"status": "sent"}), 200
 
 if __name__ == '__main__':
-    # הרצה מקומית או דרך Gunicorn
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
