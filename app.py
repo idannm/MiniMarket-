@@ -15,6 +15,9 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "my_verify_token")
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "123")
 
+@app.route('/', methods=['GET'])
+def keep_alive():
+    return "I am alive! 🤖", 200
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 def get_db_connection():
