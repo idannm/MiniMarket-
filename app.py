@@ -4,71 +4,45 @@ import psycopg2
 from flask import Flask, request, jsonify
 from groq import Groq
 import json
+from datetime import datetime
 
 app = Flask(__name__)
 
-# הגדרות סביבה
+# --- הגדרות סביבה ---
 DB_URL = os.environ.get("DB_URL")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "my_verify_token")
-
-# בדיקה שכל המשתנים קיימים
-if not all([DB_URL, GROQ_API_KEY, WHATSAPP_TOKEN, PHONE_NUMBER_ID]):
-    print("⚠️ חסרים משתני סביבה חשובים!")
-    print(f"DB_URL: {'✓' if DB_URL else '✗'}")
-    print(f"GROQ_API_KEY: {'✓' if GROQ_API_KEY else '✗'}")
-    print(f"WHATSAPP_TOKEN: {'✓' if WHATSAPP_TOKEN else '✗'}")
-    print(f"PHONE_NUMBER_ID: {'✓' if PHONE_NUMBER_ID else '✗'}")
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "Idan1234")
 
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
+# מאגר שיחות בזיכרון (כדי שהבוט יזכור מה נאמר קודם)
+user_conversations = {}
+
+# --- פונקציות מסד נתונים ---
 def get_db_connection():
-    """חיבור למסד נתונים"""
     return psycopg2.connect(DB_URL)
 
-def send_whatsapp_message(to, text):
-    """שליחת הודעת WhatsApp עם טיפול משופר"""
+def is_message_processed(message_id):
+    """בדיקה בטבלה שיצרנו למניעת כפילויות שמטא שולחת"""
     try:
-        # הסרת 0 מתחילת המספר אם קיים והוספת קידומת ישראל
-        if to.startswith("0"):
-            to = "972" + to[1:]
-        elif not to.startswith("972"):
-            to = "972" + to
-        
-        url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
-        headers = {
-            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        data = {
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
-            "text": {"body": text}
-        }
-        
-        print(f"📤 שולח הודעה ל-{to}")
-        print(f"📝 תוכן: {text[:50]}...")
-        
-        response = requests.post(url, headers=headers, json=data, timeout=10)
-        
-        print(f"📊 סטטוס: {response.status_code}")
-        
-        if response.status_code == 200:
-            print(f"✅ ההודעה נשלחה בהצלחה!")
-            return True
-        else:
-            print(f"❌ שגיאה בשליחה: {response.text}")
-            return False
-            
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM processed_messages WHERE message_id = %s", (message_id,))
+        exists = cur.fetchone() is not None
+        if not exists:
+            cur.execute("INSERT INTO processed_messages (message_id) VALUES (%s)", (message_id,))
+            conn.commit()
+        cur.close()
+        conn.close()
+        return exists
     except Exception as e:
-        print(f"❌ חריגה בשליחת הודעה: {e}")
+        print(f"DB Error checking message: {e}")
         return False
 
 def get_inventory():
-    """קבלת מלאי מהמסד נתונים"""
+    """משיכת המלאי העדכני ממסד הנתונים"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -76,233 +50,185 @@ def get_inventory():
         items = cur.fetchall()
         cur.close()
         conn.close()
-        
         if items:
-            return "\n".join([f"• {item[0]} - ₪{item[1]}" for item in items])
-        else:
-            return "אין מוצרים זמינים כרגע"
-    except Exception as e:
-        print(f"❌ שגיאה בטעינת מלאי: {e}")
+            return "\n".join([f"• {i[0]} - ₪{i[1]}" for i in items])
+        return "המלאי כרגע ריק"
+    except:
         return "שגיאה בטעינת המלאי"
 
-def save_order(customer_phone, details):
-    """שמירת הזמנה במסד נתונים"""
+def extract_and_save_order(chat_history, user_id):
+    """המוח ששולף נתונים מהשיחה ושומר לאתר"""
+    prompt = f"חלץ מהשיחה הבאה JSON בדיוק בפורמט הזה: {{'name': 'שם מלא', 'address': 'כתובת', 'items': 'רשימת מוצרים', 'total': מספר}}\n\nהשיחה:\n{chat_history}"
     try:
+        res = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": "אתה מחלץ מידע. החזר אך ורק JSON תקין ללא שום טקסט נוסף לפני או אחרי."}, 
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1
+        ).choices[0].message.content
+        
+        # ניקוי וחילוץ ה-JSON
+        data = json.loads(res[res.find("{"):res.rfind("}")+1])
+        
+        # שמירה למסד נתונים
         conn = get_db_connection()
         cur = conn.cursor()
-        
-        # בדיקה אם הטבלה תומכת בשדות אלו
-        cur.execute("""
-            INSERT INTO orders (customer_name, items, total_price, address, status) 
-            VALUES (%s, %s, %s, %s, %s) RETURNING id
-        """, (
-            customer_phone,  # ישתמש כ-customer_name
-            details,         # פרטי ההזמנה
-            0,              # סכום זמני
-            f"WhatsApp: {customer_phone}",  # כתובת עם מספר טלפון
-            'ממתין לאישור'
-        ))
-        
+        cur.execute(
+            "INSERT INTO orders (customer_name, items, total_price, address, status) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (data['name'], data['items'], data['total'], f"{data['address']} | טלפון: {user_id}", 'ממתין לאישור')
+        )
         order_id = cur.fetchone()[0]
         conn.commit()
         cur.close()
         conn.close()
-        
-        print(f"✅ הזמנה #{order_id} נשמרה בהצלחה!")
-        return order_id
-        
+        return True, order_id
     except Exception as e:
-        print(f"❌ שגיאה בשמירת הזמנה: {e}")
-        return None
+        print(f"Error saving order: {e}")
+        return False, str(e)
 
-@app.route('/')
-def home():
-    """דף בית לבדיקה"""
-    return jsonify({
-        "status": "running",
-        "service": "WhatsApp Bot",
-        "version": "2.0"
-    })
+# --- תקשורת לוואטסאפ ---
+def send_whatsapp_message(to, text):
+    """שליחת תשובה ללקוח לוואטסאפ"""
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}", 
+        "Content-Type": "application/json"
+    }
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text}
+    }
+    requests.post(url, headers=headers, json=data)
 
+# --- נקודות הקצה של השרת ---
+@app.route('/webhook', methods=['GET'])
+def verify():
+    """אימות מול מטא"""
+    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        return request.args.get("hub.challenge")
+    return "Verification failed", 403
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """קבלת הודעות, עיבוד עם חיים הבוט, ושליחת תשובה"""
+    data = request.get_json()
+    if not data:
+        return "ok", 200
+
+    try:
+        if 'entry' in data and 'changes' in data['entry'][0]:
+            value = data['entry'][0]['changes'][0]['value']
+            
+            if 'messages' in value:
+                msg = value['messages'][0]
+                if msg['type'] != 'text':
+                    return "ok", 200 # נתעלם מתמונות/סטיקרים כרגע
+                
+                sender = msg['from']
+                msg_id = msg['id']
+                user_text = msg['text']['body']
+                
+                # מניעת כפילויות מטא
+                if is_message_processed(msg_id): 
+                    return "ok", 200
+                
+                # ניהול זיכרון - שומרים עד 8 הודעות אחרונות
+                if sender not in user_conversations:
+                    user_conversations[sender] = []
+                user_conversations[sender].append({"role": "user", "content": user_text})
+                if len(user_conversations[sender]) > 8:
+                    user_conversations[sender] = user_conversations[sender][-8:]
+                
+                inventory = get_inventory()
+                
+                # האופי של חיים!
+                system_prompt = f"""
+אתה המוכר הווירטואלי של "המכולת של הצדיק". השם שלך הוא "חיים". 
+אתה לא בוט רובוטי - אתה בן אדם חם, סבלני, ישראלי ואדיב מאוד שמכיר את כל הלקוחות.
+
+המלאי המעודכן שלנו להיום (אל תמציא מוצרים שאין כאן!):
+{inventory}
+
+### 🎭 האופי וסגנון הדיבור שלך:
+1. פתיחה חמה: תמיד תהיה שמח, תשתמש במילים כמו "אלוף", "צדיק", "בשמחה רבה", "אח יקר", "שפע".
+2. אימוג'ים: תשתמש באימוג'ים שקשורים לאוכל ולשמחה (🍞, 🥛, 🎉, 🛒, 😊) אבל בטעם טוב.
+3. שפה חברית אבל מקצועית: דבר בגובה העיניים, אבל תהיה ממוקד במטרה - לעזור ללקוח לקנות.
+
+### 📜 חוקי הברזל של המכולת:
+1. שקיפות מחירים: אם לקוח שואל על מוצר, תגיד מיד אם יש אותו ובאיזה מחיר (לפי המלאי בלבד).
+2. חוסר במלאי: אם לקוח מבקש משהו שאין במלאי, תגיד שנגמר ותציע חלופה מהמלאי הקיים.
+3. הגדלת מכירה (Upsell עדין): כשהלקוח מוסיף משהו, תשאל בטבעיות אם חסר לו עוד משהו.
+
+### 🤝 תהליך סגירת ההזמנה (סופר קריטי):
+כשהלקוח מראה סימנים שהוא סיים:
+1. תן לו סיכום יפה של העגלה שלו עם הסכום הכולל.
+2. תגיד לו שאתה צריך 3 פרטים זריזים למשלוח: שם מלא, כתובת מדויקת (רחוב ומספר בית), ומספר טלפון.
+3. אתה **חייב** לוודא שיש לך את כל ה-3. אם חסר משהו, תשאל ספציפית על מה שחסר.
+4. רק כאשר יש לך את **כל הפרטים במלואם**, תסיים את ההודעה שלך בדיוק עם המילה הזו באנגלית (ובלי שום טקסט אחריה): FINALIZE_ORDER
+
+### 💡 דוגמאות לאיך אתה אמור לענות:
+לקוח: "יש לכם חלב?"
+חיים (אתה): "ברוך השם צדיק! בטח שיש, חלב עולה 6 שקלים 🥛. להוסיף לך להזמנה?"
+
+לקוח: "זהו אחי, רק החלב."
+חיים (אתה): "פיקס! סה"כ 6 שקלים. רק תרשום לי שם מלא, כתובת מדויקת וטלפון והמשלוח טס אליך! 🛵"
+"""
+                # קריאה ל-AI
+                completion = client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{"role": "system", "content": system_prompt}] + user_conversations[sender],
+                    temperature=0.7,
+                    max_tokens=500
+                )
+                bot_reply = completion.choices[0].message.content
+                
+                # שמירת תשובת הבוט בזיכרון
+                user_conversations[sender].append({"role": "assistant", "content": bot_reply})
+                
+                # סגירת הזמנה אם ה-AI החליט שהכל מוכן
+                if "FINALIZE_ORDER" in bot_reply:
+                    history = "\n".join([f"{m['role']}: {m['content']}" for m in user_conversations[sender]])
+                    success, res = extract_and_save_order(history, sender)
+                    
+                    if success:
+                        bot_reply = bot_reply.replace("FINALIZE_ORDER", "").strip()
+                        bot_reply += f"\n\n✅ הזמנה #{res} נשלחה בהצלחה למערכת וממתינה לאישור המנהל! ניצור קשר ברגע שהיא תאושר."
+                        user_conversations[sender] = [] # מחיקת הזיכרון לקראת ההזמנה הבאה
+                    else:
+                        bot_reply = "אופס צדיק, חסרים לי כמה פרטים. תוכל לוודא שרשמת שם מלא, כתובת וטלפון?"
+
+                # משלוח התשובה חזרה לוואטסאפ (תוך מחיקת מילת הקוד)
+                clean_reply = bot_reply.replace("FINALIZE_ORDER", "").strip()
+                send_whatsapp_message(sender, clean_reply)
+            
+    except Exception as e:
+        print(f"Error in webhook: {e}")
+        
+    return "ok", 200
+
+# נתיב למנהל לשלוח הודעות (למשל כשההזמנה מאושרת בדשבורד)
 @app.route('/send_update', methods=['POST'])
 def send_update():
-    """נקודת קצה לשליחת עדכונים (משמש את Streamlit)"""
     try:
         data = request.get_json()
         phone = data.get('phone')
         message = data.get('message')
         
-        if not phone or not message:
-            return jsonify({"error": "Missing phone or message"}), 400
-        
-        success = send_whatsapp_message(phone, message)
-        
-        if success:
+        if phone and message:
+            send_whatsapp_message(phone, message)
             return jsonify({"status": "sent"}), 200
-        else:
-            return jsonify({"error": "Failed to send"}), 500
-            
+        return jsonify({"error": "Missing phone or message"}), 400
     except Exception as e:
-        print(f"❌ שגיאה ב-send_update: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/webhook', methods=['GET'])
-def verify():
-    """אימות webhook"""
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-    
-    print(f"🔐 ניסיון אימות webhook")
-    print(f"Mode: {mode}, Token: {token}")
-    
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        print("✅ Webhook verified!")
-        return challenge, 200
-    else:
-        print("❌ Verification failed!")
-        return "Failed", 403
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """קבלת הודעות מ-WhatsApp"""
-    try:
-        data = request.get_json()
-        print("=" * 50)
-        print(f"📨 התקבלה הודעה חדשה:")
-        print(json.dumps(data, indent=2, ensure_ascii=False))
-        print("=" * 50)
-        
-        # בדיקה שיש entry
-        if 'entry' not in data:
-            print("⚠️ אין entry בנתונים")
-            return jsonify({"status": "no entry"}), 200
-        
-        for entry in data['entry']:
-            for change in entry.get('changes', []):
-                value = change.get('value', {})
-                
-                # בדיקה שיש הודעות
-                if 'messages' not in value:
-                    print("⚠️ אין messages בנתונים")
-                    continue
-                
-                for message in value['messages']:
-                    # קבלת פרטי המשתמש וההודעה
-                    sender = message.get('from')
-                    message_type = message.get('type')
-                    
-                    print(f"👤 שולח: {sender}")
-                    print(f"📋 סוג הודעה: {message_type}")
-                    
-                    # תמיכה רק בהודעות טקסט
-                    if message_type != 'text':
-                        print(f"⚠️ סוג הודעה לא נתמך: {message_type}")
-                        send_whatsapp_message(sender, "אני יכול לענות רק להודעות טקסט 😊")
-                        continue
-                    
-                    user_text = message.get('text', {}).get('body', '')
-                    print(f"💬 תוכן: {user_text}")
-                    
-                    # טעינת מלאי
-                    print("📦 טוען מלאי...")
-                    inventory = get_inventory()
-                    print(f"✅ מלאי נטען: {len(inventory)} תווים")
-                    
-                    # יצירת תשובה עם AI
-                    if client:
-                        print("🤖 מכין תשובה עם AI...")
-                        
-                        system_prompt = f"""
-אתה עוזר חמוד ונחמד במכולת. תמיד תהיה חביב וסבלני.
-
-המוצרים הזמינים:
-{inventory}
-
-הנחיות:
-1. ענה בעברית פשוטה וקצרה
-2. אם שואלים על מחיר - ספר מיד
-3. אם מזמינים - אשר והסבר שהמנהל יצטרך לאשר
-4. אם מוצר לא קיים - הצע חלופה
-5. תמיד היה חביב ושמח לעזור
-
-דוגמאות:
-לקוח: "כמה עולה חלב?"
-אתה: "חלב עולה 6 ש״ח 🥛 רוצה להזמין?"
-
-לקוח: "אני רוצה חלב"
-אתה: "מעולה! חלב זה 6 ש״ח 🥛 עוד משהו?"
-"""
-                        
-                        try:
-                            completion = client.chat.completions.create(
-                                model="llama-3.1-8b-instant",
-                                messages=[
-                                    {"role": "system", "content": system_prompt},
-                                    {"role": "user", "content": user_text}
-                                ],
-                                temperature=0.7,
-                                max_tokens=300
-                            )
-                            
-                            bot_reply = completion.choices[0].message.content
-                            print(f"🤖 תשובת AI: {bot_reply}")
-                            
-                        except Exception as e:
-                            print(f"❌ שגיאה ב-AI: {e}")
-                            bot_reply = "סליחה, יש לי בעיה טכנית. נסה שוב בעוד רגע 😊"
-                    
-                    else:
-                        bot_reply = "הבוט פועל! המלאי שלנו:\n" + inventory
-                    
-                    # זיהוי הזמנה ושמירה
-                    if any(word in user_text.lower() for word in ["להזמין", "הזמנה", "אני רוצה", "תן לי"]):
-                        print("🛒 מזהה כהזמנה - שומר במסד נתונים...")
-                        order_id = save_order(sender, user_text)
-                        if order_id:
-                            bot_reply += f"\n\n✅ ההזמנה שלך נרשמה (מספר #{order_id}) וממתינה לאישור המנהל!"
-                    
-                    # שליחת התשובה
-                    print("📤 שולח תשובה ללקוח...")
-                    send_whatsapp_message(sender, bot_reply)
-                    print("✅ תהליך הסתיים בהצלחה!")
-        
-        return jsonify({"status": "ok"}), 200
-        
-    except Exception as e:
-        print("=" * 50)
-        print(f"💥 שגיאה חמורה: {e}")
-        print("=" * 50)
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/health', methods=['GET'])
-def health():
-    """בדיקת תקינות"""
-    try:
-        # בדיקת חיבור למסד נתונים
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
-        cur.close()
-        conn.close()
-        
-        return jsonify({
-            "status": "healthy",
-            "database": "connected",
-            "groq": "initialized" if client else "missing",
-            "whatsapp": "configured" if WHATSAPP_TOKEN else "missing"
-        }), 200
-    except Exception as e:
-        return jsonify({
-            "status": "unhealthy",
-            "error": str(e)
-        }), 500
+@app.route('/')
+def home():
+    return jsonify({"status": "running", "bot": "Chaim the Tzadik"})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    print("=" * 50)
-    print(f"🚀 Starting WhatsApp Bot on port {port}")
-    print("=" * 50)
     app.run(host='0.0.0.0', port=port, debug=False)
