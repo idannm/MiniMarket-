@@ -56,6 +56,17 @@ def get_history(phone):
         return [{"role": r[0], "content": r[1]} for r in rows][::-1]
     except: return []
 
+# --- הפונקציה החדשה שמוחקת זיכרון אחרי סיום הזמנה ---
+def clear_history(phone):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM conversation_history WHERE phone = %s", (phone,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Clear History Error: {e}")
+
 def get_inventory():
     try:
         conn = get_db_connection()
@@ -72,7 +83,6 @@ def save_order(name, phone, address, items, original_sender_id, update_note=""):
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # אם יש הערת עדכון (כמו שינוי כתובת), נוסיף אותה להזמנה כדי שהמנהל יראה
         final_address = f"{address} | WA_ID:{original_sender_id}"
         if update_note:
             final_address = f"⚠️ שים לב: {update_note} | " + final_address
@@ -121,25 +131,24 @@ def webhook():
                 history = get_history(sender)
                 inventory = get_inventory()
                 
-                # הפרומפט החדש: מגביל את יצירת ההזמנות ומוסיף תמיכה בשינוי כתובת ושפות
                 system_prompt = f"""
                 אתה "חיים", מוכר במכולת "המכולת של הצדיק".
                 המלאי שלך להיום: {inventory}
                 
                 אופי וכללים:
                 1. דבר בטבעיות, חברותיות, ומדי פעם שים אימוג'י רלוונטי (אבל לא להגזים).
-                2. תמיכה בשפות: אם הלקוח מדבר שפה אחרת (כמו אנגלית), תענה לו בשפה שלו. תמיד תהיה מנומס.
-                3. אם הלקוח אומר "תודה", תענה פשוט "בכיף צדיק! משהו נוסף?" ואל תיצור שום הזמנה.
-                4. כדי לסגור הזמנה, חובה שיהיה לך: שם מלא, עיר, רחוב ומספר, ומה הוא רוצה לקנות. אם חסר משהו, בקש ספציפית את מה שחסר (למשל: "לאיזו עיר לשלוח?").
+                2. תמיכה בשפות: אם הלקוח מדבר שפה אחרת (כמו אנגלית או רוסית), תענה לו בשפה שלו. תמיד תהיה מנומס.
+                3. אם הלקוח אומר מילות סיום או סירוב כמו "תודה", "לא", "סגור", "זהו", "לא תודה" - תענה לו בחביבות "בכיף, שיהיה יום מקסים!" ואל תיצור שום הזמנה.
+                4. כדי לסגור הזמנה, חובה שיהיה לך: שם מלא, עיר, רחוב ומספר, ומה הוא רוצה לקנות. 
                 
                 איך מפיקים הזמנה (חשוב מאוד!):
-                - לעולם אל תפיק הזמנה (FINAL_ORDER) על דעת עצמך, אלא רק אם הלקוח נתן עכשיו את כל הפרטים וברור שהוא רוצה לסגור קנייה.
-                - רק אם החלטת לסגור הזמנה, תוסיף בשורה נפרדת בסוף:
+                - לעולם אל תפיק הזמנה (FINAL_ORDER) על דעת עצמך, במיוחד אם הלקוח רק אמר "לא" לעוד מוצרים!
+                - רק אם הלקוח נתן הרגע את כל הפרטים למשלוח ומחכה לסיום, תוסיף בשורה נפרדת בסוף:
                 FINAL_ORDER|{sender}|[שם]|[רחוב ומספר, עיר]|[מוצרים]|[הערות למנהל]
                 
                 דוגמאות להערות למנהל:
-                - אם זו הזמנה רגילה, תכתוב בהערות "רגיל".
-                - אם הלקוח אומר שטעה בכתובת ורוצה לעדכן, תכתוב בהערות "הלקוח עדכן כתובת".
+                - רגיל: "רגיל"
+                - עדכון: "הלקוח עדכן כתובת"
                 """
                 
                 if client:
@@ -150,10 +159,8 @@ def webhook():
                     )
                     bot_reply = completion.choices[0].message.content.strip()
                     
-                    # בדיקה אם יש ניסיון ליצור הזמנה ואם זה לא מטעות (כמו אמירת "תודה")
-                    if "FINAL_ORDER|" in bot_reply and not any(word in text.lower() for word in ["תודה", "thank you", "thanks", "do you speak", "hello"]):
+                    if "FINAL_ORDER|" in bot_reply:
                         try:
-                            # בידוד שורת הפקודה משאר הטקסט
                             order_line = [line for line in bot_reply.split('\n') if "FINAL_ORDER|" in line][0]
                             parts = order_line.split("|")
                             
@@ -163,16 +170,21 @@ def webhook():
                                 items = parts[4].strip()
                                 update_note = parts[5].strip()
                                 
-                                # מעבירים למנהל הערה אם הכתובת שונתה
                                 admin_note = "הלקוח עדכן את הכתובת!" if "עדכן כתובת" in update_note else ""
                                 
+                                # שמירת ההזמנה
                                 oid = save_order(name, sender, addr, items, sender, admin_note)
                                 
-                                final_msg = f"פיקס {name}! ההזמנה (#{oid}) הועברה לאישור הבוס ⏳\n(נשלח אליך: {items} לכתובת: {addr})"
+                                # הודעה ללקוח בלי מספר ההזמנה!
+                                final_msg = f"פיקס {name}! ההזמנה הועברה לאישור הבוס ⏳\n(נשלח אליך: {items} לכתובת: {addr})"
                                 if admin_note:
                                     final_msg += "\n*שמתי לב שתיקנת את הכתובת, עדכנתי את המנהל!*"
                                     
                                 send_whatsapp(sender, final_msg)
+                                
+                                # מחיקת הזיכרון כדי למנוע הזמנות שרשרת בהמשך!
+                                clear_history(sender)
+                                
                             else:
                                 send_whatsapp(sender, "חסרים לי כמה פרטים. תוכל לוודא שנתת לי שם, עיר, רחוב ומוצרים?")
                                 
@@ -180,7 +192,6 @@ def webhook():
                             print(f"Parsing error: {e}")
                             send_whatsapp(sender, "אופס, הייתה לי תקלה קטנה. תוכל לכתוב לי שוב מה תרצה ואיפה אתה גר (כולל עיר)?")
                     else:
-                        # אם זו לא הזמנה, מנקים בטעות פקודות FINAL_ORDER שהAI דחף ושולחים טקסט נקי
                         clean_reply = "\n".join([line for line in bot_reply.split('\n') if "FINAL_ORDER|" not in line]).strip()
                         if clean_reply:
                             send_whatsapp(sender, clean_reply)
@@ -201,7 +212,9 @@ def send_update():
     
     data = request.json
     phone = str(data.get('phone')).strip()
-    send_whatsapp(phone, data.get('message'))
+    # מסירים פה את התצוגה של מספר ההזמנה שנשלח מהדשבורד אם קיים
+    msg_to_send = data.get('message')
+    send_whatsapp(phone, msg_to_send)
     return jsonify({"status": "sent"}), 200
 
 if __name__ == '__main__':
