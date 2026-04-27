@@ -12,7 +12,7 @@ DB_URL = os.environ.get("DB_URL")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "my_verify_token")
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "my_secret_password")
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "123")
 
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -33,9 +33,7 @@ def is_message_processed(message_id):
         conn.commit()
         conn.close()
         return False 
-    except Exception as e:
-        print(f"Deduplication Error: {e}")
-        return False 
+    except: return False 
 
 def save_message(phone, role, content):
     try:
@@ -56,7 +54,6 @@ def get_history(phone):
         return [{"role": r[0], "content": r[1]} for r in rows][::-1]
     except: return []
 
-# --- הפונקציה החדשה שמוחקת זיכרון אחרי סיום הזמנה ---
 def clear_history(phone):
     try:
         conn = get_db_connection()
@@ -64,8 +61,7 @@ def clear_history(phone):
         cur.execute("DELETE FROM conversation_history WHERE phone = %s", (phone,))
         conn.commit()
         conn.close()
-    except Exception as e:
-        print(f"Clear History Error: {e}")
+    except: pass
 
 def get_inventory():
     try:
@@ -74,28 +70,34 @@ def get_inventory():
         cur.execute("SELECT name, price FROM products WHERE stock > 0")
         items = cur.fetchall()
         conn.close()
-        if items: return ", ".join([f"{i[0]} ({i[1]}₪)" for i in items])
-        return "אין סחורה כרגע"
+        return ", ".join([f"{i[0]} ({i[1]}₪)" for i in items]) if items else "המלאי כרגע ריק"
     except: return "שגיאה בטעינת המלאי"
 
-def save_order(name, phone, address, items, original_sender_id, update_note=""):
+def save_order(name, phone, address, items, original_sender_id, order_type):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
         final_address = f"{address} | WA_ID:{original_sender_id}"
-        if update_note:
-            final_address = f"⚠️ שים לב: {update_note} | " + final_address
-            
-        cur.execute("INSERT INTO orders (customer_name, items, status, total_price, address) VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                    (name, items, 'ממתין לאישור', 0, final_address))
+        cur.execute("INSERT INTO orders (customer_name, items, status, total_price, address, order_type) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                    (name, items, 'ממתין לאישור', 0, final_address, order_type))
         new_id = cur.fetchone()[0]
         conn.commit()
         conn.close()
         return new_id
     except Exception as e:
-        print(f"Save Error: {e}")
+        print(f"Error saving order: {e}")
         return None
+
+def save_complaint(name, phone, description):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO complaints (customer_name, phone, description) VALUES (%s, %s, %s)",
+                    (name, phone, description))
+        conn.commit()
+        conn.close()
+        return True
+    except: return False
 
 def send_whatsapp(to, text):
     try:
@@ -103,14 +105,22 @@ def send_whatsapp(to, text):
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
         data = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
-        r = requests.post(url, headers=headers, json=data)
-        if r.status_code == 200:
-            save_message(to, "assistant", text)
+        requests.post(url, headers=headers, json=data)
+        save_message(to, "assistant", text)
     except: pass
 
+@app.route('/webhook', methods=['GET'])
+def verify_webhook():
+    mode = request.args.get('hub.mode')
+    token = request.args.get('hub.verify_token')
+    challenge = request.args.get('hub.challenge')
+    if mode == 'subscribe' and token == VERIFY_TOKEN:
+        return challenge, 200
+    return 'Forbidden', 403
+
 @app.route('/webhook', methods=['POST'])
-def webhook():
-    data = request.get_json()
+def receive_message():
+    data = request.json
     try:
         if 'entry' in data and 'changes' in data['entry'][0]:
             value = data['entry'][0]['changes'][0]['value']
@@ -124,147 +134,81 @@ def webhook():
                 sender = msg['from']
                 text = msg['text']['body']
                 
-                if is_message_processed(msg_id):
-                    return "ok", 200 
+                if is_message_processed(msg_id): 
+                    return "ok", 200
                 
                 save_message(sender, "user", text)
                 history = get_history(sender)
                 inventory = get_inventory()
                 
                 system_prompt = f"""
-                אתה "חיים", מוכר במכולת "המכולת של הצדיק".
-                המלאי שלך להיום: {inventory}
+                אתה "חיים", המוכר האדיב במכולת. המלאי: {inventory}
                 
-                אופי וכללים:
-                1. דבר בטבעיות, חברותיות, ומדי פעם שים אימוג'י רלוונטי (אבל לא להגזים).
-                2. תמיכה בשפות: אם הלקוח מדבר שפה אחרת (כמו אנגלית או רוסית), תענה לו בשפה שלו. תמיד תהיה מנומס.
-                3. אם הלקוח אומר מילות סיום או סירוב כמו "תודה", "לא", "סגור", "זהו", "לא תודה" - תענה לו בחביבות "בכיף, שיהיה יום מקסים!" ואל תיצור שום הזמנה.
-                4. כדי לסגור הזמנה, חובה שיהיה לך: שם מלא, עיר, רחוב ומספר, ומה הוא רוצה לקנות. 
+                חוקי ברזל - חובה לעבוד שלב אחרי שלב, לעולם אל תשאל שאלות של שלב מתקדם לפני שסיימת את הנוכחי:
                 
-                איך מפיקים הזמנה (חשוב מאוד!):
-                - לעולם אל תפיק הזמנה (FINAL_ORDER) על דעת עצמך, במיוחד אם הלקוח רק אמר "לא" לעוד מוצרים!
-                - רק אם הלקוח נתן הרגע את כל הפרטים למשלוח ומחכה לסיום, תוסיף בשורה נפרדת בסוף:
-                FINAL_ORDER|{sender}|[שם]|[רחוב ומספר, עיר]|[מוצרים]|[הערות למנהל]
+                שלב 1 - בחירת מוצרים: 
+                כשהלקוח מבקש מוצר, הוסף אותו והגב משהו כמו: "מעולה, שמתי לך. תרצה להוסיף עוד משהו? 🍞🥛". (אל תשאל על משלוח או כתובת בשלב זה!).
                 
-                דוגמאות להערות למנהל:
-                - רגיל: "רגיל"
-                - עדכון: "הלקוח עדכן כתובת"
+                שלב 2 - סיכום וסוג קבלה:
+                *רק אחרי* שהלקוח אמר מפורשות שהוא סיים (למשל "זהו", "לא תודה", "אני רוצה את הכל"), הצג לו את המחיר הסופי ושאל שאלה אחת בלבד: "תרצה משלוח עד הבית 🛵 או לבוא לקחת מהמקום (איסוף עצמי) 🛒?"
+                
+                שלב 3 - איסוף פרטים:
+                - אם הלקוח בחר איסוף עצמי: בקש ממנו שם מלא בלבד.
+                - אם הלקוח בחר משלוח: בקש ממנו שם מלא, עיר, רחוב ומספר בית.
+                
+                שלב 4 - סגירה:
+                רק אחרי שהלקוח ענה וסיפק את כל הפרטים הרלוונטיים, הוצא את הפקודה FINAL_ORDER.
+                
+                כללים נוספים:
+                - שפות: ענה ללקוח בשפה שבה הוא פונה אליך (למשל, אנגלית).
+                - טלפון: השתמש תמיד במספר המזהה {sender}. אל תבקש מהלקוח מספר טלפון!
+                - תלונות: אם הלקוח מתלונן, הוצא FINAL_COMPLAINT.
+                
+                פורמטים (בסוף ההודעה בלבד, בשורה נפרדת):
+                FINAL_ORDER|{sender}|[שם]|[כתובת או 'איסוף עצמי']|[מוצרים]|[משלוח או איסוף עצמי]
+                FINAL_COMPLAINT|{sender}|[שם]|[תיאור התלונה]
                 """
                 
                 if client:
                     completion = client.chat.completions.create(
                         model="llama-3.3-70b-versatile",
                         messages=[{"role": "system", "content": system_prompt}] + history,
-                        temperature=0.2, max_tokens=250
+                        temperature=0.2, 
+                        max_tokens=300
                     )
                     bot_reply = completion.choices[0].message.content.strip()
                     
-                    if "FINAL_ORDER|" in bot_reply:
-                        try:
-                            order_line = [line for line in bot_reply.split('\n') if "FINAL_ORDER|" in line][0]
-                            parts = order_line.split("|")
-                            
-                            if len(parts) >= 6:
-                                name = parts[2].strip()
-                                addr = parts[3].strip()
-                                items = parts[4].strip()
-                                update_note = parts[5].strip()
-                                
-                                admin_note = "הלקוח עדכן את הכתובת!" if "עדכן כתובת" in update_note else ""
-                                
-                                # שמירת ההזמנה
-                                oid = save_order(name, sender, addr, items, sender, admin_note)
-                                
-                                # הודעה ללקוח בלי מספר ההזמנה!
-                                final_msg = f"פיקס {name}! ההזמנה הועברה לאישור הבוס ⏳\n(נשלח אליך: {items} לכתובת: {addr})"
-                                if admin_note:
-                                    final_msg += "\n*שמתי לב שתיקנת את הכתובת, עדכנתי את המנהל!*"
-                                    
-                                send_whatsapp(sender, final_msg)
-                                
-                                # מחיקת הזיכרון כדי למנוע הזמנות שרשרת בהמשך!
-                                clear_history(sender)
-                                
-                            else:
-                                send_whatsapp(sender, "חסרים לי כמה פרטים. תוכל לוודא שנתת לי שם, עיר, רחוב ומוצרים?")
-                                
-                        except Exception as e:
-                            print(f"Parsing error: {e}")
-                            send_whatsapp(sender, "אופס, הייתה לי תקלה קטנה. תוכל לכתוב לי שוב מה תרצה ואיפה אתה גר (כולל עיר)?")
+                    if "FINAL_COMPLAINT|" in bot_reply:
+                        parts = bot_reply.split("|")
+                        if len(parts) >= 4:
+                            save_complaint(parts[2], parts[1], parts[3])
+                            send_whatsapp(sender, "מצטער לשמוע צדיק. התלונה הועברה למנהל לטיפול מיידי! 🙏")
+                            clear_history(sender)
+                    elif "FINAL_ORDER|" in bot_reply:
+                        parts = bot_reply.split("|")
+                        if len(parts) >= 6:
+                            oid = save_order(parts[2], parts[1], parts[3], parts[4], sender, parts[5])
+                            send_whatsapp(sender, f"פיקס {parts[2]}! ההזמנה הועברה לאישור הבוס ⏳")
+                            clear_history(sender)
                     else:
-                        clean_reply = "\n".join([line for line in bot_reply.split('\n') if "FINAL_ORDER|" not in line]).strip()
+                        clean_reply = bot_reply.replace("FINAL_ORDER", "").replace("FINAL_COMPLAINT", "").strip()
                         if clean_reply:
                             send_whatsapp(sender, clean_reply)
-                    
+                            
     except Exception as e: 
-        print(f"Error: {e}")
-    return "ok", 200
+        print(f"Webhook Error: {e}")
+        
+    return 'EVENT_RECEIVED', 200
 
-@app.route('/webhook', methods=['GET'])
-def verify():
-    if request.args.get("hub.verify_token") == VERIFY_TOKEN: return request.args.get("hub.challenge")
-    return "Error", 403
-# --- הוסף את הפונקציה הזו לשמירת תלונות ---
-def save_complaint(name, phone, description):
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO complaints (customer_name, phone, description) VALUES (%s, %s, %s)",
-                    (name, phone, description))
-        conn.commit()
-        conn.close()
-        return True
-    except: return False
-
-# --- בתוך ה-webhook, נעדכן את ה-system_prompt ---
-# (שים לב לשינויים בחוקים ובמבנה ה-FINAL_ORDER)
-
-system_prompt = f"""
-            אתה "חיים", המוכר האדיב במכולת. המלאי: {inventory}
-            
-            חוקי ברזל - חובה לעבוד שלב אחרי שלב, לעולם אל תשאל שאלות של שלב מתקדם לפני שסיימת את הנוכחי:
-            
-            שלב 1 - בחירת מוצרים: 
-            כשהלקוח מבקש מוצר, הוסף אותו והגב משהו כמו: "מעולה, שמתי לך. תרצה להוסיף עוד משהו? 🍞🥛". (אל תשאל על משלוח או כתובת בשלב זה!).
-            
-            שלב 2 - סיכום וסוג קבלה:
-            *רק אחרי* שהלקוח אמר מפורשות שהוא סיים (למשל "זהו", "לא תודה", "אני רוצה את הכל"), הצג לו את המחיר הסופי ושאל שאלה אחת בלבד: "תרצה משלוח עד הבית 🛵 או לבוא לקחת מהמקום (איסוף עצמי) 🛒?"
-            
-            שלב 3 - איסוף פרטים:
-            - אם הלקוח בחר איסוף עצמי: בקש ממנו שם מלא בלבד.
-            - אם הלקוח בחר משלוח: בקש ממנו שם מלא, עיר, רחוב ומספר בית.
-            
-            שלב 4 - סגירה:
-            רק אחרי שהלקוח ענה וסיפק את כל הפרטים הרלוונטיים (בהתאם למשלוח/איסוף), תוציא את הפקודה FINAL_ORDER.
-            
-            כללים נוספים:
-            - שפות: ענה ללקוח בשפה שבה הוא פונה אליך (למשל, אנגלית).
-            - טלפון: השתמש תמיד במספר המזהה {sender}. אל תבקש מהלקוח מספר טלפון!
-            - תלונות: אם הלקוח מתלונן, הוצא FINAL_COMPLAINT.
-            
-            פורמטים (בסוף ההודעה בלבד, בשורה נפרדת):
-            FINAL_ORDER|{sender}|[שם]|[כתובת או 'איסוף עצמי']|[מוצרים]|[משלוח או איסוף עצמי]
-            FINAL_COMPLAINT|{sender}|[שם]|[תיאור התלונה]
-            """
-
-# --- עדכון הלוגיקה של הטיפול בתשובה ---
-if "FINAL_COMPLAINT|" in bot_reply:
-    parts = bot_reply.split("|")
-    save_complaint(parts[2], parts[1], parts[3])
-    send_whatsapp(sender, "מצטער לשמוע על החוויה הזו . התלונה הועברה למנהל לבדיקה ותוטפל בהקדם האפשרי! 🙏")
-    clear_history(sender)
-elif "FINAL_ORDER|" in bot_reply:
-    # ... (הלוגיקה הקיימת עם הוספת עמודת order_type ב-save_order)
 @app.route('/send_update', methods=['POST'])
 def send_update():
     auth = request.headers.get('X-Internal-Secret')
-    if auth != INTERNAL_SECRET: return jsonify({"error": "Unauthorized"}), 401
+    if auth != INTERNAL_SECRET: 
+        return jsonify({"error": "Unauthorized"}), 401
     
     data = request.json
     phone = str(data.get('phone')).strip()
-    # מסירים פה את התצוגה של מספר ההזמנה שנשלח מהדשבורד אם קיים
-    msg_to_send = data.get('message')
-    send_whatsapp(phone, msg_to_send)
+    send_whatsapp(phone, data.get('message'))
     return jsonify({"status": "sent"}), 200
 
 if __name__ == '__main__':
