@@ -4,6 +4,7 @@ import psycopg2
 from flask import Flask, request, jsonify
 from groq import Groq
 import json
+import time
 
 app = Flask(__name__)
 
@@ -36,13 +37,16 @@ def is_message_processed(message_id):
     except: return False 
 
 def save_message(phone, role, content):
+    """שינינו כאן כדי שהפונקציה תחזיר את המספר הסידורי של ההודעה"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("INSERT INTO conversation_history (phone, role, content) VALUES (%s, %s, %s)", (phone, role, content))
+        cur.execute("INSERT INTO conversation_history (phone, role, content) VALUES (%s, %s, %s) RETURNING id", (phone, role, content))
+        new_id = cur.fetchone()[0]
         conn.commit()
         conn.close()
-    except: pass
+        return new_id
+    except: return None
 
 def get_history(phone):
     try:
@@ -137,36 +141,51 @@ def receive_message():
                 if is_message_processed(msg_id): 
                     return "ok", 200
                 
-                save_message(sender, "user", text)
+                # שמירת ההודעה וקבלת המספר הסידורי שלה
+                my_msg_id = save_message(sender, "user", text)
+                
+                # --- מנגנון ה"נשימה העמוקה" ---
+                # מחכים 2.5 שניות לראות אם הלקוח שולח עוד משהו
+                time.sleep(2.5)
+                
+                # בודקים האם נכנסה הודעה חדשה יותר בזמן שחיכינו
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT MAX(id) FROM conversation_history WHERE phone = %s AND role = 'user'", (sender,))
+                latest_msg_id = cur.fetchone()[0]
+                conn.close()
+                
+                # אם הגיעה הודעה חדשה יותר, ההודעה הנוכחית עוצרת ונותנת לחדשה להמשיך!
+                if latest_msg_id and my_msg_id and latest_msg_id > my_msg_id:
+                    print("הלקוח שלח עוד הודעה ברצף, מאחד הודעות...")
+                    return "ok", 200
+                # ------------------------------
+                
                 history = get_history(sender)
                 inventory = get_inventory()
                 
                 system_prompt = f"""
                 אתה "חיים", המוכר האדיב במכולת. המלאי: {inventory}
                 
-                חוקי ברזל - חובה לעבוד שלב אחרי שלב, לעולם אל תשאל שאלות של שלב מתקדם לפני שסיימת את הנוכחי:
+                חוקי ברזל - חובה לעבוד שלב אחרי שלב:
                 
-                שלב 1 - בחירת מוצרים: 
-                כשהלקוח מבקש מוצר, הוסף אותו והגב משהו כמו: "מעולה, שמתי לך. תרצה להוסיף עוד משהו? 🍞🥛". (אל תשאל על משלוח או כתובת בשלב זה!).
+                הערה ללקוח שולח רצף הודעות:
+                אם הלקוח שאל שאלה אישית (כמו "מה קורה?") ומיד ביקש לקנות, תתייחס קודם בקצרה לשאלה שלו ("הכל מעולה ברוך השם!"), ואז באותה הודעה תעבור לשלב 1: "שמתי לך...".
                 
-                שלב 2 - סיכום וסוג קבלה:
-                *רק אחרי* שהלקוח אמר מפורשות שהוא סיים (למשל "זהו", "לא תודה", "אני רוצה את הכל"), הצג לו את המחיר הסופי ושאל שאלה אחת בלבד: "תרצה משלוח עד הבית 🛵 או לבוא לקחת מהמקום (איסוף עצמי) 🛒?"
+                שלב 1 - הוספת מוצרים: 
+                כשהלקוח מבקש מוצרים, ספר לו כמה זה יוצא עד כה ושאל: "תרצה להוסיף עוד משהו? 🍞🥛". (אל תשאל בשלב זה על משלוח או פרטים).
                 
-                שלב 3 - איסוף פרטים:
-                - אם הלקוח בחר איסוף עצמי: בקש ממנו שם מלא בלבד.
-                - אם הלקוח בחר משלוח: בקש ממנו שם מלא, עיר, רחוב ומספר בית.
+                שלב 2 - משלוח או איסוף:
+                רק אחרי שהלקוח אישר שסיים לבחור, שאל: "תרצה משלוח עד הבית 🛵 או לבוא לקחת מהמקום (איסוף עצמי) 🛒?"
                 
-                שלב 4 - סגירה:
-                רק אחרי שהלקוח ענה וסיפק את כל הפרטים הרלוונטיים, הוצא את הפקודה FINAL_ORDER.
+                שלב 3 - פרטים:
+                - איסוף עצמי: בקש שם מלא בלבד. 
+                - משלוח: בקש שם מלא, עיר, רחוב ומספר בית.
                 
-                כללים נוספים:
-                - שפות: ענה ללקוח בשפה שבה הוא פונה אליך (למשל, אנגלית).
-                - טלפון: השתמש תמיד במספר המזהה {sender}. אל תבקש מהלקוח מספר טלפון!
-                - תלונות: אם הלקוח מתלונן, הוצא FINAL_COMPLAINT.
-                
-                פורמטים (בסוף ההודעה בלבד, בשורה נפרדת):
-                FINAL_ORDER|{sender}|[שם]|[כתובת או 'איסוף עצמי']|[מוצרים]|[משלוח או איסוף עצמי]
-                FINAL_COMPLAINT|{sender}|[שם]|[תיאור התלונה]
+                שלב 4 - סגירה ופקודה:
+                לעולם אל תוציא את הפקודה FINAL_ORDER אם הלקוח לא כתב שם מלא אמיתי.
+                רק כשיש את כל הפרטים, הוצא בשורה חדשה:
+                FINAL_ORDER|{sender}|[שם]|[כתובת או 'איסוף מהמקום']|[מוצרים]|[משלוח או איסוף עצמי]
                 """
                 
                 if client:
@@ -182,14 +201,28 @@ def receive_message():
                         parts = bot_reply.split("|")
                         if len(parts) >= 4:
                             save_complaint(parts[2], parts[1], parts[3])
-                            send_whatsapp(sender, "מצטער לשמוע צדיק. התלונה הועברה למנהל לטיפול מיידי! 🙏")
+                            send_whatsapp(sender, "מצטער לשמוע. התלונה הועברה למנהל לטיפול מיידי! 🙏")
                             clear_history(sender)
                     elif "FINAL_ORDER|" in bot_reply:
                         parts = bot_reply.split("|")
                         if len(parts) >= 6:
-                            oid = save_order(parts[2], parts[1], parts[3], parts[4], sender, parts[5])
-                            send_whatsapp(sender, f"פיקס {parts[2]}! ההזמנה הועברה לאישור הבוס ⏳")
-                            clear_history(sender)
+                            name = parts[2].strip()
+                            address = parts[3].strip()
+                            items = parts[4].strip()
+                            order_type = parts[5].strip()
+                            
+                            if "[שם]" in name or name == "" or "name" in name.lower():
+                                send_whatsapp(sender, "שכחתי לשאול - איך קוראים לך? (שם מלא בבקשה) כדי שאוכל לרשום על ההזמנה.")
+                            else:
+                                oid = save_order(name, sender, address, items, sender, order_type)
+                                
+                                if "איסוף" in order_type or "לקחת" in order_type:
+                                    final_msg = f"פיקס {name}! ההזמנה התקבלה במכולת. אנחנו מתחילים לארוז לך 🛒, ומיד תקבל הודעה מתי אפשר לבוא לקחת.\n\n*נ.ב. זמן ההמתנה המקסימלי עד קבלת האישור וההזמנה הוא 20 דקות!*"
+                                else:
+                                    final_msg = f"פיקס {name}! ההזמנה הועברה לאישור הבוס ⏳ נעדכן מיד כשהמשלוח ייצא."
+                                
+                                send_whatsapp(sender, final_msg)
+                                clear_history(sender)
                     else:
                         clean_reply = bot_reply.replace("FINAL_ORDER", "").replace("FINAL_COMPLAINT", "").strip()
                         if clean_reply:
