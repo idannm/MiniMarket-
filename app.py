@@ -204,7 +204,45 @@ def webhook():
 def verify():
     if request.args.get("hub.verify_token") == VERIFY_TOKEN: return request.args.get("hub.challenge")
     return "Error", 403
+# --- הוסף את הפונקציה הזו לשמירת תלונות ---
+def save_complaint(name, phone, description):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO complaints (customer_name, phone, description) VALUES (%s, %s, %s)",
+                    (name, phone, description))
+        conn.commit()
+        conn.close()
+        return True
+    except: return False
 
+# --- בתוך ה-webhook, נעדכן את ה-system_prompt ---
+# (שים לב לשינויים בחוקים ובמבנה ה-FINAL_ORDER)
+
+system_prompt = f"""
+אתה "חיים", המוכר במכולת "המכולת של הצדיק".
+המלאי: {inventory}
+
+חוקים חדשים:
+1. שאל תמיד: "תרצה משלוח עד הבית 🛵 או לבוא לקחת מהמקום (איסוף עצמי) 🛒?"
+2. אם הלקוח בוחר איסוף עצמי: בקש רק שם מלא ומספר טלפון. אל תבקש כתובת!
+3. אם הלקוח בוחר משלוח: בקש שם מלא, עיר, רחוב ומספר בית.
+4. טלפון: אם הלקוח אומר "המספר הזה" או "המספר ממנו אני כותב", השתמש במספר {sender}.
+5. תלונות: אם הלקוח מתלונן על טעות או בעיה, סכם את התלונה והוצא פקודת FINAL_COMPLAINT.
+
+איך מפיקים פקודות:
+- הזמנה: FINAL_ORDER|{sender}|[שם]|[כתובת או 'איסוף עצמי']|[מוצרים]|[סוג: משלוח/איסוף]
+- תלונה: FINAL_COMPLAINT|{sender}|[שם]|[תיאור התלונה]
+"""
+
+# --- עדכון הלוגיקה של הטיפול בתשובה ---
+if "FINAL_COMPLAINT|" in bot_reply:
+    parts = bot_reply.split("|")
+    save_complaint(parts[2], parts[1], parts[3])
+    send_whatsapp(sender, "מצטער לשמוע על החוויה הזו . התלונה הועברה למנהל לבדיקה ותוטפל בהקדם האפשרי! 🙏")
+    clear_history(sender)
+elif "FINAL_ORDER|" in bot_reply:
+    # ... (הלוגיקה הקיימת עם הוספת עמודת order_type ב-save_order)
 @app.route('/send_update', methods=['POST'])
 def send_update():
     auth = request.headers.get('X-Internal-Secret')
