@@ -20,29 +20,22 @@ client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 def get_db_connection():
     return psycopg2.connect(DB_URL)
 
-# --- פונקציה חדשה למניעת כפילויות ---
 def is_message_processed(message_id):
-    """בודק אם ההודעה כבר טופלה בעבר. אם לא - רושם אותה."""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
-        # בדיקה אם קיים
         cur.execute("SELECT 1 FROM processed_messages WHERE message_id = %s", (message_id,))
         exists = cur.fetchone()
-        
         if exists:
             conn.close()
-            return True # ההודעה כבר טופלה!
-            
-        # אם לא קיים - נרשום אותה
+            return True 
         cur.execute("INSERT INTO processed_messages (message_id) VALUES (%s)", (message_id,))
         conn.commit()
         conn.close()
-        return False # הודעה חדשה, אפשר לטפל בה
+        return False 
     except Exception as e:
         print(f"Deduplication Error: {e}")
-        return False # במקרה של שגיאה, ננסה לענות בכל זאת
+        return False 
 
 def save_message(phone, role, content):
     try:
@@ -71,16 +64,19 @@ def get_inventory():
         items = cur.fetchall()
         conn.close()
         if items: return ", ".join([f"{i[0]} ({i[1]}₪)" for i in items])
-        return "אין סחורה"
-    except: return "שגיאה בטעינה"
+        return "אין סחורה כרגע"
+    except: return "שגיאה בטעינת המלאי"
 
-def save_order(name, phone, address, items, original_sender_id):
+def save_order(name, phone, address, items, original_sender_id, update_note=""):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # שומרים את ה-ID המקורי בתוך הכתובת כדי שנוכל לחזור אליו מהדשבורד
-        final_address = f"{address} | WA_ID:{original_sender_id}"
         
+        # אם יש הערת עדכון (כמו שינוי כתובת), נוסיף אותה להזמנה כדי שהמנהל יראה
+        final_address = f"{address} | WA_ID:{original_sender_id}"
+        if update_note:
+            final_address = f"⚠️ שים לב: {update_note} | " + final_address
+            
         cur.execute("INSERT INTO orders (customer_name, items, status, total_price, address) VALUES (%s, %s, %s, %s, %s) RETURNING id",
                     (name, items, 'ממתין לאישור', 0, final_address))
         new_id = cur.fetchone()[0]
@@ -111,69 +107,83 @@ def webhook():
             if 'messages' in value:
                 msg = value['messages'][0]
                 
-                # מוודא שזו הודעת טקסט בלבד
                 if msg.get('type') != 'text':
                     return "ok", 200
                     
-                msg_id = msg['id'] # המזהה הייחודי של ההודעה
+                msg_id = msg['id']
                 sender = msg['from']
                 text = msg['text']['body']
                 
-                # --- תיקון קריטי: בדיקת כפילויות ---
                 if is_message_processed(msg_id):
-                    print(f"Duplicate message ignored: {msg_id}")
-                    return "ok", 200 # מחזירים אישור לוואטסאפ אבל לא עושים כלום
+                    return "ok", 200 
                 
-                # מכאן ממשיכים רגיל רק אם ההודעה חדשה
                 save_message(sender, "user", text)
                 history = get_history(sender)
                 inventory = get_inventory()
                 
+                # הפרומפט החדש: מגביל את יצירת ההזמנות ומוסיף תמיכה בשינוי כתובת ושפות
                 system_prompt = f"""
-                אתה "בוטי", המוכר האדיב במכולת. המלאי: {inventory}
+                אתה "חיים", מוכר במכולת "המכולת של הצדיק".
+                המלאי שלך להיום: {inventory}
                 
-                חוקים:
-                1. תענה באופן טבעי, קצר ושירותי.
-                2. אם הלקוח שואל שאלות כלליות ("מה הזמנתי?", "מה קורה?") - תענה רגיל. אל תיצור הזמנה!
-                3. כדי לסגור הזמנה חובה שיהיה לך מהלקוח: שם, כתובת, ומוצרים שהוא רוצה.
-                4. רק כשהלקוח אישר שהוא מסיים ויש לך את כל הפרטים, תוסיף *בסוף ההודעה שלך (בשורה חדשה)* את הפקודה המדויקת הבאה:
-                FINAL_ORDER|{sender}|[שם]|[כתובת]|[מוצרים]
+                אופי וכללים:
+                1. דבר בטבעיות, חברותיות, ומדי פעם שים אימוג'י רלוונטי (אבל לא להגזים).
+                2. תמיכה בשפות: אם הלקוח מדבר שפה אחרת (כמו אנגלית), תענה לו בשפה שלו. תמיד תהיה מנומס.
+                3. אם הלקוח אומר "תודה", תענה פשוט "בכיף צדיק! משהו נוסף?" ואל תיצור שום הזמנה.
+                4. כדי לסגור הזמנה, חובה שיהיה לך: שם מלא, עיר, רחוב ומספר, ומה הוא רוצה לקנות. אם חסר משהו, בקש ספציפית את מה שחסר (למשל: "לאיזו עיר לשלוח?").
+                
+                איך מפיקים הזמנה (חשוב מאוד!):
+                - לעולם אל תפיק הזמנה (FINAL_ORDER) על דעת עצמך, אלא רק אם הלקוח נתן עכשיו את כל הפרטים וברור שהוא רוצה לסגור קנייה.
+                - רק אם החלטת לסגור הזמנה, תוסיף בשורה נפרדת בסוף:
+                FINAL_ORDER|{sender}|[שם]|[רחוב ומספר, עיר]|[מוצרים]|[הערות למנהל]
+                
+                דוגמאות להערות למנהל:
+                - אם זו הזמנה רגילה, תכתוב בהערות "רגיל".
+                - אם הלקוח אומר שטעה בכתובת ורוצה לעדכן, תכתוב בהערות "הלקוח עדכן כתובת".
                 """
                 
                 if client:
                     completion = client.chat.completions.create(
                         model="llama-3.3-70b-versatile",
                         messages=[{"role": "system", "content": system_prompt}] + history,
-                        temperature=0.3, max_tokens=200
+                        temperature=0.2, max_tokens=250
                     )
                     bot_reply = completion.choices[0].message.content.strip()
                     
-                    # בדיקה אם זו הזמנה אמיתית
-                    if "FINAL_ORDER|" in bot_reply and "מה הזמנתי" not in text:
+                    # בדיקה אם יש ניסיון ליצור הזמנה ואם זה לא מטעות (כמו אמירת "תודה")
+                    if "FINAL_ORDER|" in bot_reply and not any(word in text.lower() for word in ["תודה", "thank you", "thanks", "do you speak", "hello"]):
                         try:
-                            # מבודדים את שורת הפקודה משאר הטקסט במקרה שה-AI כתב גם "תודה רבה" וכו'
+                            # בידוד שורת הפקודה משאר הטקסט
                             order_line = [line for line in bot_reply.split('\n') if "FINAL_ORDER|" in line][0]
                             parts = order_line.split("|")
                             
-                            # חגורת בטיחות: מוודאים שה-AI באמת החזיר 5 חלקים כמו שביקשנו
-                            if len(parts) >= 5:
+                            if len(parts) >= 6:
                                 name = parts[2].strip()
                                 addr = parts[3].strip()
                                 items = parts[4].strip()
+                                update_note = parts[5].strip()
                                 
-                                oid = save_order(name, sender, addr, items, sender)
-                                final_msg = f"תודה {name}, הזמנה #{oid} הועברה לאישור המנהל! ⏳\n(פרטים: {items} לכתובת {addr})"
+                                # מעבירים למנהל הערה אם הכתובת שונתה
+                                admin_note = "הלקוח עדכן את הכתובת!" if "עדכן כתובת" in update_note else ""
+                                
+                                oid = save_order(name, sender, addr, items, sender, admin_note)
+                                
+                                final_msg = f"פיקס {name}! ההזמנה (#{oid}) הועברה לאישור הבוס ⏳\n(נשלח אליך: {items} לכתובת: {addr})"
+                                if admin_note:
+                                    final_msg += "\n*שמתי לב שתיקנת את הכתובת, עדכנתי את המנהל!*"
+                                    
                                 send_whatsapp(sender, final_msg)
                             else:
-                                send_whatsapp(sender, "חסרים לי כמה פרטים. תוכל לוודא שנתת לי שם, כתובת ומוצרים?")
+                                send_whatsapp(sender, "חסרים לי כמה פרטים. תוכל לוודא שנתת לי שם, עיר, רחוב ומוצרים?")
                                 
                         except Exception as e:
                             print(f"Parsing error: {e}")
-                            send_whatsapp(sender, "הייתה לי בעיה קטנה לסגור את ההזמנה, תוכל לחזור על הפרטים (שם, כתובת, מוצרים)?")
+                            send_whatsapp(sender, "אופס, הייתה לי תקלה קטנה. תוכל לכתוב לי שוב מה תרצה ואיפה אתה גר (כולל עיר)?")
                     else:
-                        # מנקים מילת קוד במקרה וה-AI השתמש בה בטעות, ושולחים את הטקסט נקי
-                        clean_reply = bot_reply.replace(f"FINAL_ORDER|{sender}|", "").split("|")[0].strip()
-                        send_whatsapp(sender, clean_reply)
+                        # אם זו לא הזמנה, מנקים בטעות פקודות FINAL_ORDER שהAI דחף ושולחים טקסט נקי
+                        clean_reply = "\n".join([line for line in bot_reply.split('\n') if "FINAL_ORDER|" not in line]).strip()
+                        if clean_reply:
+                            send_whatsapp(sender, clean_reply)
                     
     except Exception as e: 
         print(f"Error: {e}")
