@@ -24,7 +24,7 @@ DEBOUNCE_SECS   = 2.5
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# --- Connection Pool (במקום לפתוח חיבור חדש בכל קריאה) ---
+# --- Connection Pool ---
 db_pool = pool.ThreadedConnectionPool(minconn=2, maxconn=10, dsn=DB_URL)
 
 def get_conn():
@@ -33,7 +33,7 @@ def get_conn():
 def release_conn(conn):
     db_pool.putconn(conn)
 
-# --- Debounce state עם Lock למניעת race conditions ---
+# --- Debounce state ---
 pending_messages: dict[str, list[str]] = {}
 pending_timers:   dict[str, threading.Timer] = {}
 debounce_lock = threading.Lock()
@@ -43,27 +43,21 @@ debounce_lock = threading.Lock()
 # ─────────────────────────────────────────────
 
 def is_message_processed(message_id: str) -> bool:
-    """בדיקה ושמירה אטומית — מונע עיבוד כפול גם תחת עומס."""
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
-            """
-            INSERT INTO processed_messages (message_id)
-            VALUES (%s)
-            ON CONFLICT (message_id) DO NOTHING
-            RETURNING id
-            """,
+            "INSERT INTO processed_messages (message_id) VALUES (%s) ON CONFLICT (message_id) DO NOTHING RETURNING id",
             (message_id,)
         )
         inserted = cur.fetchone()
         conn.commit()
         cur.close()
-        return inserted is None   # True = כבר עובד, False = חדש
+        return inserted is None
     except Exception as e:
         log.error("is_message_processed error: %s", e)
         conn.rollback()
-        return True               # ספק → תדלג, עדיף מאשר כפול
+        return True
     finally:
         release_conn(conn)
 
@@ -90,13 +84,7 @@ def get_history(phone: str, limit: int = 8) -> list[dict]:
     try:
         cur = conn.cursor()
         cur.execute(
-            """
-            SELECT role, content
-            FROM conversation_history
-            WHERE phone = %s
-            ORDER BY created_at DESC
-            LIMIT %s
-            """,
+            "SELECT role, content FROM conversation_history WHERE phone = %s ORDER BY created_at DESC LIMIT %s",
             (phone, limit)
         )
         rows = cur.fetchall()
@@ -138,16 +126,91 @@ def get_inventory() -> str:
         release_conn(conn)
 
 
+def get_pending_order(phone: str) -> dict | None:
+    """
+    מחזיר הזמנה פתוחה של הלקוח אם קיימת.
+    זה מה שנותן לבוט "זיכרון" אמיתי של הזמנות — ישירות מה-DB.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, customer_name, items, address, order_type
+            FROM orders
+            WHERE address LIKE %s AND status = 'ממתין לאישור'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (f"%WA_ID:{phone}%",)
+        )
+        row = cur.fetchone()
+        cur.close()
+        if row:
+            return {
+                "id":            row[0],
+                "customer_name": row[1],
+                "items":         row[2],
+                "address":       row[3],
+                "order_type":    row[4],
+            }
+        return None
+    except Exception as e:
+        log.error("get_pending_order error: %s", e)
+        return None
+    finally:
+        release_conn(conn)
+
+
+def update_order_address(order_id: int, new_address: str, phone: str) -> bool:
+    """עדכון כתובת הזמנה — שומר את ה-WA_ID"""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        final_address = f"{new_address} | WA_ID:{phone}"
+        cur.execute(
+            "UPDATE orders SET address = %s WHERE id = %s AND status = 'ממתין לאישור'",
+            (final_address, order_id)
+        )
+        affected = cur.rowcount
+        conn.commit()
+        cur.close()
+        return affected > 0
+    except Exception as e:
+        log.error("update_order_address error: %s", e)
+        conn.rollback()
+        return False
+    finally:
+        release_conn(conn)
+
+
+def cancel_order_by_customer(order_id: int) -> bool:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE orders SET status='בוטל', cancellation_reason='ביקוש לקוח' WHERE id=%s AND status='ממתין לאישור'",
+            (order_id,)
+        )
+        affected = cur.rowcount
+        conn.commit()
+        cur.close()
+        return affected > 0
+    except Exception as e:
+        log.error("cancel_order_by_customer error: %s", e)
+        conn.rollback()
+        return False
+    finally:
+        release_conn(conn)
+
+
 def save_order(name: str, phone: str, address: str, items: str, order_type: str) -> int | None:
     conn = get_conn()
     try:
         cur = conn.cursor()
         final_address = f"{address} | WA_ID:{phone}"
         cur.execute(
-            """
-            INSERT INTO orders (customer_name, items, status, total_price, address, order_type)
-            VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
-            """,
+            "INSERT INTO orders (customer_name, items, status, total_price, address, order_type) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
             (name, items, "ממתין לאישור", 0, final_address, order_type)
         )
         new_id = cur.fetchone()[0]
@@ -167,7 +230,7 @@ def save_complaint(name: str, phone: str, description: str) -> bool:
     try:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO complaints (customer_name, phone, description) VALUES (%s, %s, %s)",
+            "INSERT INTO complaints (customer_name, phone, description) VALUES (%s,%s,%s)",
             (name, phone, description)
         )
         conn.commit()
@@ -186,7 +249,6 @@ def save_complaint(name: str, phone: str, description: str) -> bool:
 # ─────────────────────────────────────────────
 
 def normalize_phone(phone: str) -> str:
-    """המרה לפורמט בינלאומי ישראלי."""
     if phone.startswith("0"):
         return "972" + phone[1:]
     if not phone.startswith("972"):
@@ -195,14 +257,10 @@ def normalize_phone(phone: str) -> str:
 
 
 def send_whatsapp(phone: str, text: str) -> bool:
-    """שולח הודעה ושומר ב-DB עם אותו מפתח phone (לפני normalization)."""
     wa_phone = normalize_phone(phone)
     try:
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
-        headers = {
-            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-            "Content-Type": "application/json"
-        }
+        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
         payload = {
             "messaging_product": "whatsapp",
             "to": wa_phone,
@@ -211,7 +269,6 @@ def send_whatsapp(phone: str, text: str) -> bool:
         }
         r = requests.post(url, headers=headers, json=payload, timeout=10)
         if r.status_code == 200:
-            # שמירה עם המפתח המקורי, אותו מפתח שבו הלקוח מזוהה בהיסטוריה
             save_message(phone, "assistant", text)
             log.info("Sent to %s", wa_phone)
             return True
@@ -224,30 +281,21 @@ def send_whatsapp(phone: str, text: str) -> bool:
 
 
 # ─────────────────────────────────────────────
-# Debounce — קיבוץ הודעות
+# Debounce
 # ─────────────────────────────────────────────
 
 def enqueue_message(phone: str, text: str) -> None:
-    """מוסיף הודעה לתור ומאפס את הטיימר."""
     with debounce_lock:
         pending_messages.setdefault(phone, []).append(text)
-
-        # ביטול טיימר קיים
         t = pending_timers.get(phone)
         if t and t.is_alive():
             t.cancel()
-
-        # טיימר חדש
         new_timer = threading.Timer(DEBOUNCE_SECS, process_messages, args=[phone])
         pending_timers[phone] = new_timer
         new_timer.start()
 
 
 def process_messages(phone: str) -> None:
-    """
-    מופעל אחרי שקט של DEBOUNCE_SECS.
-    שולף את כל הטקסטים, מקבץ, שולח ל-AI פעם אחת.
-    """
     with debounce_lock:
         texts = pending_messages.pop(phone, [])
         pending_timers.pop(phone, None)
@@ -256,32 +304,55 @@ def process_messages(phone: str) -> None:
         return
 
     combined_text = "\n".join(texts)
-    log.info("Processing %d messages from %s", len(texts), phone)
+    log.info("Processing %d messages from %s: %s", len(texts), phone, combined_text[:80])
 
-    # שמירת ההודעה המאוחדת — רק עכשיו, לפני שמושכים את ה-history
     save_message(phone, "user", combined_text)
-
-    # history כעת כולל את combined_text בתחתיתו
-    history = get_history(phone)
+    history   = get_history(phone)
     inventory = get_inventory()
 
-    system_prompt = f"""אתה "חיים", המוכר האדיב במכולת "המכולת של הצדיק".
-המלאי הזמין כרגע: {inventory}
+    # ── הזמנה פתוחה קיימת? ──
+    pending_order = get_pending_order(phone)
 
-חוקים קריטיים:
+    if pending_order:
+        address_clean = pending_order['address'].split('|')[0].strip()
+        pending_ctx = f"""
+⚠️ ללקוח יש הזמנה פתוחה שממתינה לאישור:
+  מספר הזמנה: #{pending_order['id']}
+  שם: {pending_order['customer_name']}
+  מוצרים: {pending_order['items']}
+  כתובת נוכחית: {address_clean}
+  סוג: {pending_order['order_type']}
+
+אם הלקוח רוצה לשנות כתובת / מספר דירה / קומה / כניסה / כל פרט של הכתובת:
+→ רשום: UPDATE_ADDRESS|{pending_order['id']}|[הכתובת המלאה החדשה]
+
+אם הלקוח רוצה לבטל:
+→ רשום: CANCEL_ORDER|{pending_order['id']}
+
+אסור ליצור הזמנה חדשה כל עוד יש הזמנה פתוחה!
+"""
+    else:
+        pending_ctx = "אין הזמנות פתוחות ללקוח זה — ניתן לקבל הזמנה חדשה."
+
+    system_prompt = f"""אתה "חיים", המוכר האדיב במכולת "המכולת של הצדיק".
+המלאי: {inventory}
+
+{pending_ctx}
+
+חוקים:
 1. ענה בעברית פשוטה וטבעית.
-2. קרא את כל ההודעות של הלקוח וענה על הכל בתשובה אחת.
+2. ענה על הכל בתשובה אחת בלבד.
 3. אל תחזור על עצמך.
 
-🚨 אם הלקוח כועס/מתלונן (מילים: מגעיל, רקוב, קרוע, זבל):
-- התנצל מיד ואל תציע קניות
-- כתוב: FINAL_COMPLAINT|{phone}|[שם]|[תיאור]
+🚨 תלונות (מגעיל / רקוב / קרוע / זבל):
+- התנצל, אל תציע קניות
+- רשום: FINAL_COMPLAINT|{phone}|[שם]|[תיאור]
 
-🛒 קניות (שלב אחרי שלב):
-1. בחירת מוצרים → "תרצה להוסיף עוד משהו?"
-2. כשסיים → "משלוח 🛵 או איסוף 🛒?"
-3. פרטים: משלוח=שם+עיר+רחוב, איסוף=שם בלבד
-4. רק כשיש שם מלא → FINAL_ORDER|{phone}|[שם]|[כתובת/איסוף]|[מוצרים]|[סוג]"""
+🛒 קניות (רק אם אין הזמנה פתוחה):
+שלב 1 — בחירת מוצרים → "תרצה להוסיף עוד משהו?"
+שלב 2 — כשסיים → "משלוח 🛵 או איסוף 🛒?"
+שלב 3 — פרטים: משלוח=שם+עיר+רחוב+מספר בית, איסוף=שם בלבד
+שלב 4 — כשיש שם מלא → FINAL_ORDER|{phone}|[שם]|[כתובת/איסוף]|[מוצרים]|[סוג]"""
 
     if not groq_client:
         send_whatsapp(phone, f"שלום! המלאי שלנו:\n{inventory}")
@@ -293,13 +364,51 @@ def process_messages(phone: str) -> None:
             messages=[{"role": "system", "content": system_prompt}] + history,
             temperature=0.2,
             max_tokens=300,
-            timeout=15,   # לא תתקע לנצח
+            timeout=15,
         )
         bot_reply = completion.choices[0].message.content.strip()
-        log.info("AI reply for %s: %s", phone, bot_reply[:80])
+        log.info("AI reply for %s: %s", phone, bot_reply[:100])
 
-        if "FINAL_COMPLAINT|" in bot_reply:
-            parts = bot_reply.split("|")
+        # ── UPDATE_ADDRESS ──
+        if "UPDATE_ADDRESS|" in bot_reply:
+            parts     = bot_reply.split("|")
+            clean_msg = bot_reply.split("UPDATE_ADDRESS|")[0].strip()
+            if len(parts) >= 3:
+                try:
+                    order_id    = int(parts[1].strip())
+                    new_address = parts[2].strip()
+                    success = update_order_address(order_id, new_address, phone)
+                    if success:
+                        if clean_msg:
+                            send_whatsapp(phone, clean_msg)
+                        send_whatsapp(phone, f"✅ עדכנתי את הכתובת להזמנה #{order_id}:\n📍 {new_address}\n\nאם הכל בסדר — ממתינים לאישור הבוס!")
+                    else:
+                        send_whatsapp(phone, "אופס, לא הצלחתי לעדכן. נסה שוב? 🙏")
+                except (ValueError, IndexError) as e:
+                    log.error("UPDATE_ADDRESS parse error: %s", e)
+                    send_whatsapp(phone, "לא הצלחתי לעדכן את הכתובת. תנסח שוב? 🙏")
+
+        # ── CANCEL_ORDER ──
+        elif "CANCEL_ORDER|" in bot_reply:
+            parts     = bot_reply.split("|")
+            clean_msg = bot_reply.split("CANCEL_ORDER|")[0].strip()
+            if len(parts) >= 2:
+                try:
+                    order_id = int(parts[1].strip())
+                    success  = cancel_order_by_customer(order_id)
+                    if clean_msg:
+                        send_whatsapp(phone, clean_msg)
+                    if success:
+                        send_whatsapp(phone, f"✅ ההזמנה #{order_id} בוטלה. אם תרצה להזמין שוב — אני כאן! 😊")
+                    else:
+                        send_whatsapp(phone, "לא הצלחתי לבטל — יכול להיות שההזמנה כבר אושרה. צור קשר עם הבוס ישירות.")
+                    clear_history(phone)
+                except (ValueError, IndexError) as e:
+                    log.error("CANCEL_ORDER parse error: %s", e)
+
+        # ── FINAL_COMPLAINT ──
+        elif "FINAL_COMPLAINT|" in bot_reply:
+            parts     = bot_reply.split("|")
             clean_msg = bot_reply.split("FINAL_COMPLAINT|")[0].strip()
             if clean_msg:
                 send_whatsapp(phone, clean_msg)
@@ -308,8 +417,9 @@ def process_messages(phone: str) -> None:
                 send_whatsapp(phone, "העברתי את התלונה ישירות לבוס לבדיקה דחופה! 🤕")
                 clear_history(phone)
 
+        # ── FINAL_ORDER ──
         elif "FINAL_ORDER|" in bot_reply:
-            parts = bot_reply.split("|")
+            parts     = bot_reply.split("|")
             clean_msg = bot_reply.split("FINAL_ORDER|")[0].strip()
             if len(parts) >= 6:
                 name       = parts[2].strip()
@@ -323,16 +433,24 @@ def process_messages(phone: str) -> None:
                     order_id = save_order(name, phone, address, items, order_type)
                     if order_id:
                         if "איסוף" in order_type.lower():
-                            msg = f"פרפקט {name}! הזמנה #{order_id} התקבלה 📦 מתחילים לארוז — נעדכן מתי לבוא 🛒"
+                            msg = f"פרפקט {name}! הזמנה #{order_id} התקבלה 📦\nמתחילים לארוז — נעדכן מתי לבוא 🛒\n\n💡 שכחת משהו? רוצה לשנות כתובת? פשוט כתוב לי!"
                         else:
-                            msg = f"יופי {name}! הזמנה #{order_id} הועברה לבוס ⏳ נעדכן כשהמשלוח ייצא 🛵"
+                            msg = f"יופי {name}! הזמנה #{order_id} הועברה לבוס ⏳\nנעדכן כשהמשלוח ייצא 🛵\n\n💡 שכחת לציין מספר דירה? רוצה לשנות כתובת? פשוט כתוב לי!"
                         send_whatsapp(phone, msg)
                         clear_history(phone)
                     else:
                         send_whatsapp(phone, "אופס, הייתה בעיה טכנית. נסה שוב? 🙏")
 
+        # ── תשובה רגילה ──
         else:
-            clean_reply = bot_reply.replace("FINAL_ORDER", "").replace("FINAL_COMPLAINT", "").strip()
+            clean_reply = (
+                bot_reply
+                .replace("FINAL_ORDER", "")
+                .replace("FINAL_COMPLAINT", "")
+                .replace("UPDATE_ADDRESS", "")
+                .replace("CANCEL_ORDER", "")
+                .strip()
+            )
             if clean_reply:
                 send_whatsapp(phone, clean_reply)
 
@@ -405,9 +523,9 @@ def send_update():
 @app.route('/')
 def home():
     return jsonify({
-        "status": "running",
+        "status":  "running",
         "service": "WhatsApp Bot — המכולת של הצדיק",
-        "version": "4.0"
+        "version": "5.0"
     })
 
 
