@@ -184,6 +184,27 @@ def update_order_address(order_id: int, new_address: str, phone: str) -> bool:
         release_conn(conn)
 
 
+def update_order_items(order_id: int, new_items: str) -> bool:
+    """עדכון מוצרים בהזמנה במידה והלקוח התחרט והוסיף/הוריד דברים"""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE orders SET items = %s WHERE id = %s AND status = 'ממתין לאישור'",
+            (new_items, order_id)
+        )
+        affected = cur.rowcount
+        conn.commit()
+        cur.close()
+        return affected > 0
+    except Exception as e:
+        log.error("update_order_items error: %s", e)
+        conn.rollback()
+        return False
+    finally:
+        release_conn(conn)
+
+
 def cancel_order_by_customer(order_id: int) -> bool:
     conn = get_conn()
     try:
@@ -323,13 +344,17 @@ def process_messages(phone: str) -> None:
   כתובת נוכחית: {address_clean}
   סוג: {pending_order['order_type']}
 
+אם הלקוח מבקש להוסיף או להוריד מוצרים מההזמנה שלו:
+→ רשום בפירוש את הרשימה המעודכנת בתבנית: UPDATE_ITEMS|{pending_order['id']}|[המוצרים הקודמים + החדשים שביקש]
+
 אם הלקוח רוצה לשנות כתובת / מספר דירה / קומה / כניסה / כל פרט של הכתובת:
 → רשום: UPDATE_ADDRESS|{pending_order['id']}|[הכתובת המלאה החדשה]
 
-אם הלקוח רוצה לבטל:
+אם הלקוח ממש מבקש לבטל הכל לגמרי או מתעקש להתחיל מאפס חדש:
 → רשום: CANCEL_ORDER|{pending_order['id']}
 
-אסור ליצור הזמנה חדשה כל עוד יש הזמנה פתוחה!
+חשוב מאוד: אל תשגע את הלקוח להגיד "אי אפשר ליצור הזמנה חדשה".
+תהיה שירותי ותזרום! אם הוא רוצה להוסיף מוצרים פשוט תשתמש ב UPDATE_ITEMS. אם הוא אומר "בטל את זה אני אפתח חדש" תשתמש ב CANCEL_ORDER אלא אם כן תצליח להבין אותו ולעדכן את ההזמנה עם UPDATE_ITEMS.
 """
     else:
         pending_ctx = "אין הזמנות פתוחות ללקוח זה — ניתן לקבל הזמנה חדשה."
@@ -369,8 +394,27 @@ def process_messages(phone: str) -> None:
         bot_reply = completion.choices[0].message.content.strip()
         log.info("AI reply for %s: %s", phone, bot_reply[:100])
 
+        # ── UPDATE_ITEMS ──
+        if "UPDATE_ITEMS|" in bot_reply:
+            parts     = bot_reply.split("|")
+            clean_msg = bot_reply.split("UPDATE_ITEMS|")[0].strip()
+            if len(parts) >= 3:
+                try:
+                    order_id  = int(parts[1].strip())
+                    new_items = parts[2].strip()
+                    success   = update_order_items(order_id, new_items)
+                    if success:
+                        if clean_msg:
+                            send_whatsapp(phone, clean_msg)
+                        send_whatsapp(phone, f"✅ עדכנתי בשבילך את ההזמנה!\nהמוצרים עכשיו בהזמנה #{order_id}:\n🛍️ {new_items}\n\nממתינים לאישור הבוס!")
+                    else:
+                        send_whatsapp(phone, "אופס, לא הצלחתי לעדכן את המוצרים. נסה שוב? 🙏")
+                except (ValueError, IndexError) as e:
+                    log.error("UPDATE_ITEMS parse error: %s", e)
+                    send_whatsapp(phone, "לא הצלחתי לעדכן את המוצרים. תנסח שוב? 🙏")
+
         # ── UPDATE_ADDRESS ──
-        if "UPDATE_ADDRESS|" in bot_reply:
+        elif "UPDATE_ADDRESS|" in bot_reply:
             parts     = bot_reply.split("|")
             clean_msg = bot_reply.split("UPDATE_ADDRESS|")[0].strip()
             if len(parts) >= 3:
@@ -399,7 +443,7 @@ def process_messages(phone: str) -> None:
                     if clean_msg:
                         send_whatsapp(phone, clean_msg)
                     if success:
-                        send_whatsapp(phone, f"✅ ההזמנה #{order_id} בוטלה. אם תרצה להזמין שוב — אני כאן! 😊")
+                        send_whatsapp(phone, f"✅ ההזמנה #{order_id} בוטלה לבקשתך. אם תרצה להזמין שוב מחדש — אני כאן! 😊")
                     else:
                         send_whatsapp(phone, "לא הצלחתי לבטל — יכול להיות שההזמנה כבר אושרה. צור קשר עם הבוס ישירות.")
                     clear_history(phone)
@@ -433,9 +477,9 @@ def process_messages(phone: str) -> None:
                     order_id = save_order(name, phone, address, items, order_type)
                     if order_id:
                         if "איסוף" in order_type.lower():
-                            msg = f"פרפקט {name}! הזמנה #{order_id} התקבלה 📦\nמתחילים לארוז — נעדכן מתי לבוא 🛒\n\n💡 שכחת משהו? רוצה לשנות כתובת? פשוט כתוב לי!"
+                            msg = f"פרפקט {name}! הזמנה #{order_id} התקבלה 📦\nמתחילים לארוז — נעדכן מתי לבוא 🛒\n\n💡 שכחת משהו? רוצה לשנות משהו? פשוט כתוב לי!"
                         else:
-                            msg = f"יופי {name}! הזמנה #{order_id} הועברה לבוס ⏳\nנעדכן כשהמשלוח ייצא 🛵\n\n💡 שכחת לציין מספר דירה? רוצה לשנות כתובת? פשוט כתוב לי!"
+                            msg = f"יופי {name}! הזמנה #{order_id} הועברה לבוס ⏳\nנעדכן כשהמשלוח ייצא 🛵\n\n💡 שכחת לציין מספר דירה? רוצה לשנות משהו? פשוט כתוב לי!"
                         send_whatsapp(phone, msg)
                         clear_history(phone)
                     else:
@@ -448,6 +492,7 @@ def process_messages(phone: str) -> None:
                 .replace("FINAL_ORDER", "")
                 .replace("FINAL_COMPLAINT", "")
                 .replace("UPDATE_ADDRESS", "")
+                .replace("UPDATE_ITEMS", "")
                 .replace("CANCEL_ORDER", "")
                 .strip()
             )
