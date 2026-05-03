@@ -7,13 +7,11 @@ from psycopg2 import pool
 from flask import Flask, request, jsonify
 from groq import Groq
 
-# --- לוגים ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# --- הגדרות ---
 DB_URL          = os.environ.get("DB_URL")
 GROQ_API_KEY    = os.environ.get("GROQ_API_KEY")
 WHATSAPP_TOKEN  = os.environ.get("WHATSAPP_TOKEN")
@@ -24,7 +22,6 @@ DEBOUNCE_SECS   = 2.5
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# --- Connection Pool ---
 db_pool = pool.ThreadedConnectionPool(minconn=2, maxconn=10, dsn=DB_URL)
 
 def get_conn():
@@ -33,7 +30,6 @@ def get_conn():
 def release_conn(conn):
     db_pool.putconn(conn)
 
-# --- Debounce state ---
 pending_messages: dict[str, list[str]] = {}
 pending_timers:   dict[str, threading.Timer] = {}
 debounce_lock = threading.Lock()
@@ -79,7 +75,7 @@ def save_message(phone: str, role: str, content: str) -> None:
         release_conn(conn)
 
 
-def get_history(phone: str, limit: int = 8) -> list[dict]:
+def get_history(phone: str, limit: int = 10) -> list[dict]:
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -126,17 +122,24 @@ def get_inventory() -> str:
         release_conn(conn)
 
 
-def get_pending_order(phone: str) -> dict | None:
-    """מחזיר הזמנה פתוחה של הלקוח אם קיימת."""
+def get_customer_order(phone: str) -> dict | None:
+    """
+    מחזיר את ההזמנה הרלוונטית של הלקוח:
+    - קודם מחפש הזמנה 'ממתין לאישור' (ניתנת לעריכה)
+    - אחר כך מחפש הזמנה 'אושר' (נעולה)
+    - מחזיר None אם אין כלום
+    """
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, customer_name, items, address, order_type
+            SELECT id, customer_name, items, address, order_type, status
             FROM orders
-            WHERE address LIKE %s AND status = 'ממתין לאישור'
-            ORDER BY created_at DESC
+            WHERE address LIKE %s AND status IN ('ממתין לאישור', 'אושר')
+            ORDER BY
+                CASE status WHEN 'ממתין לאישור' THEN 0 ELSE 1 END,
+                created_at DESC
             LIMIT 1
             """,
             (f"%WA_ID:{phone}%",)
@@ -150,17 +153,39 @@ def get_pending_order(phone: str) -> dict | None:
                 "items":         row[2],
                 "address":       row[3],
                 "order_type":    row[4],
+                "status":        row[5],
+                "is_editable":   row[5] == 'ממתין לאישור',
+                "is_approved":   row[5] == 'אושר',
             }
         return None
     except Exception as e:
-        log.error("get_pending_order error: %s", e)
+        log.error("get_customer_order error: %s", e)
         return None
     finally:
         release_conn(conn)
 
 
+def update_order_items(order_id: int, new_items: str) -> bool:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE orders SET items = %s WHERE id = %s AND status = 'ממתין לאישור'",
+            (new_items, order_id)
+        )
+        affected = cur.rowcount
+        conn.commit()
+        cur.close()
+        return affected > 0
+    except Exception as e:
+        log.error("update_order_items error: %s", e)
+        conn.rollback()
+        return False
+    finally:
+        release_conn(conn)
+
+
 def update_order_address(order_id: int, new_address: str, phone: str) -> bool:
-    """עדכון כתובת הזמנה — שומר את ה-WA_ID"""
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -181,34 +206,13 @@ def update_order_address(order_id: int, new_address: str, phone: str) -> bool:
         release_conn(conn)
 
 
-def update_order_items(order_id: int, new_items: str) -> bool:
-    """עדכון מוצרים בהזמנה קיימת"""
+def cancel_order_by_customer(order_id: int, reason: str = "ביקוש לקוח") -> bool:
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE orders SET items = %s WHERE id = %s AND status = 'ממתין לאישור'",
-            (new_items, order_id)
-        )
-        affected = cur.rowcount
-        conn.commit()
-        cur.close()
-        return affected > 0
-    except Exception as e:
-        log.error("update_order_items error: %s", e)
-        conn.rollback()
-        return False
-    finally:
-        release_conn(conn)
-
-
-def cancel_order_by_customer(order_id: int) -> bool:
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE orders SET status='בוטל', cancellation_reason='ביקוש לקוח' WHERE id=%s AND status='ממתין לאישור'",
-            (order_id,)
+            "UPDATE orders SET status='בוטל', cancellation_reason=%s WHERE id=%s AND status='ממתין לאישור'",
+            (reason, order_id)
         )
         affected = cur.rowcount
         conn.commit()
@@ -263,7 +267,7 @@ def save_complaint(name: str, phone: str, description: str) -> bool:
 
 
 # ─────────────────────────────────────────────
-# WhatsApp send
+# WhatsApp
 # ─────────────────────────────────────────────
 
 def normalize_phone(phone: str) -> str:
@@ -279,20 +283,14 @@ def send_whatsapp(phone: str, text: str) -> bool:
     try:
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": wa_phone,
-            "type": "text",
-            "text": {"body": text}
-        }
+        payload = {"messaging_product": "whatsapp", "to": wa_phone, "type": "text", "text": {"body": text}}
         r = requests.post(url, headers=headers, json=payload, timeout=10)
         if r.status_code == 200:
             save_message(phone, "assistant", text)
             log.info("Sent to %s", wa_phone)
             return True
-        else:
-            log.error("WA send failed %s: %s", r.status_code, r.text)
-            return False
+        log.error("WA send failed %s: %s", r.status_code, r.text)
+        return False
     except Exception as e:
         log.error("send_whatsapp error: %s", e)
         return False
@@ -328,54 +326,79 @@ def process_messages(phone: str) -> None:
     history   = get_history(phone)
     inventory = get_inventory()
 
-    # ── הזמנה פתוחה קיימת? ──
-    pending_order = get_pending_order(phone)
+    # ── בדוק מצב הזמנה ──
+    existing_order = get_customer_order(phone)
 
-    if pending_order:
-        address_clean = pending_order['address'].split('|')[0].strip()
-        pending_ctx = f"""
-ℹ️ ללקוח יש הזמנה פתוחה שממתינה לאישור הבעל הבית (לא הלקוח מאשר — הבעל הבית מאשר!):
-  מספר הזמנה: #{pending_order['id']}
-  שם: {pending_order['customer_name']}
-  מוצרים כרגע: {pending_order['items']}
+    if existing_order and existing_order["is_approved"]:
+        # ═══════════════════════════════════════════
+        # הזמנה אושרה — נעולה לחלוטין
+        # ═══════════════════════════════════════════
+        address_clean = existing_order['address'].split('|')[0].strip()
+        order_ctx = f"""
+🔒 ללקוח יש הזמנה שכבר אושרה על ידי הבעל הבית — לא ניתן לשנות דבר!
+  מספר הזמנה: #{existing_order['id']}
+  מוצרים: {existing_order['items']}
   כתובת: {address_clean}
-  סוג: {pending_order['order_type']}
+  סוג: {existing_order['order_type']}
+  סטטוס: ✅ אושר — בדרך!
 
-מה הלקוח יכול לעשות עם ההזמנה הפתוחה:
+אם הלקוח מבקש לשנות כתובת, להוסיף מוצרים, לבטל — אמור לו בנועם:
+"ההזמנה כבר אושרה ובדרך אליך, לא ניתן לשנות יותר 😊"
 
-✅ להוסיף מוצרים — אם הלקוח רוצה להוסיף מוצרים לרשימה, עדכן את כל הרשימה ורשום:
-UPDATE_ITEMS|{pending_order['id']}|[רשימה מלאה של כל המוצרים כולל הישנים והחדשים]
-
-✅ לשנות כתובת / מספר דירה / קומה / כניסה — רשום:
-UPDATE_ADDRESS|{pending_order['id']}|[הכתובת המלאה החדשה]
-
-✅ לבטל את ההזמנה — רשום:
-CANCEL_ORDER|{pending_order['id']}
-
-✅ לעשות הזמנה חדשה בנוסף — מותר לחלוטין! תמשיך בתהליך הזמנה רגיל (שאל מוצרים, משלוח/איסוף, שם וכו').
-   כלומר אם הלקוח רוצה להזמין עוד דברים כהזמנה נפרדת — תן לו!
-
-חשוב: אל תגיד ללקוח שהוא "לא יכול" לעשות הזמנה חדשה. הוא יכול!
+אם הלקוח רוצה הזמנה חדשה (נוספת) — מותר לחלוטין, תמשיך בתהליך רגיל.
 """
+
+    elif existing_order and existing_order["is_editable"]:
+        # ═══════════════════════════════════════════
+        # הזמנה פתוחה — ניתנת לעריכה + שכנוע
+        # ═══════════════════════════════════════════
+        address_clean = existing_order['address'].split('|')[0].strip()
+        order_ctx = f"""
+📋 ללקוח יש הזמנה פתוחה שממתינה לאישור הבעל הבית:
+  מספר הזמנה: #{existing_order['id']}
+  מוצרים כרגע: {existing_order['items']}
+  כתובת: {address_clean}
+  סוג: {existing_order['order_type']}
+
+מה מותר לעשות:
+
+✅ להוסיף מוצרים — אם הלקוח רוצה להוסיף, עדכן את הרשימה המלאה:
+UPDATE_ITEMS|{existing_order['id']}|[כל המוצרים כולל הישנים + החדשים]
+
+✅ לשנות כתובת:
+UPDATE_ADDRESS|{existing_order['id']}|[כתובת חדשה מלאה]
+
+✅ לבטל — אבל קודם נסה לשכנע! (ראה הוראות שכנוע למטה)
+
+✅ הזמנה נוספת — מותר לחלוטין, תמשיך בתהליך רגיל.
+
+🎯 הוראות שכנוע — אם הלקוח אומר "לא רוצה" / "בטל" / "לא צריך":
+1. נסה פעם אחת בלבד: "בטוח? יש לנו [מוצר רלוונטי מהמלאי] במבצע 😊" 
+2. אם הלקוח עדיין מסרב — שחרר אותו מיד בלי ללחוץ עוד, ורשום:
+CANCEL_ORDER|{existing_order['id']}|[סיבת הביטול במילים קצרות של הלקוח]
+"""
+
     else:
-        pending_ctx = "אין הזמנות פתוחות ללקוח זה — ניתן לקבל הזמנה חדשה."
+        # ═══════════════════════════════════════════
+        # אין הזמנה פתוחה — קניות רגילות
+        # ═══════════════════════════════════════════
+        order_ctx = "אין הזמנות פתוחות ללקוח זה — ניתן לקבל הזמנה חדשה."
 
     system_prompt = f"""אתה "חיים", המוכר האדיב במכולת "המכולת של הצדיק".
 המלאי: {inventory}
 
-{pending_ctx}
+{order_ctx}
 
 חוקים:
-1. ענה בעברית פשוטה וטבעית.
+1. ענה בעברית פשוטה וטבעית — היה חם ואנושי.
 2. ענה על הכל בתשובה אחת בלבד.
 3. אל תחזור על עצמך.
-4. לעולם אל תגיד ללקוח שהוא "לא יכול" לעשות הזמנה חדשה — הוא תמיד יכול!
 
 🚨 תלונות (מגעיל / רקוב / קרוע / זבל):
-- התנצל, אל תציע קניות
+- התנצל מיד, אל תציע קניות
 - רשום: FINAL_COMPLAINT|{phone}|[שם]|[תיאור]
 
-🛒 קניות (גם אם יש הזמנה פתוחה — מותר!):
+🛒 קניות (כשאין הזמנה פתוחה, או כהזמנה נוספת):
 שלב 1 — בחירת מוצרים → "תרצה להוסיף עוד משהו?"
 שלב 2 — כשסיים → "משלוח 🛵 או איסוף 🛒?"
 שלב 3 — פרטים: משלוח=שם+עיר+רחוב+מספר בית, איסוף=שם בלבד
@@ -402,18 +425,17 @@ CANCEL_ORDER|{pending_order['id']}
             clean_msg = bot_reply.split("UPDATE_ITEMS|")[0].strip()
             if len(parts) >= 3:
                 try:
-                    order_id   = int(parts[1].strip())
-                    new_items  = parts[2].strip()
-                    success = update_order_items(order_id, new_items)
+                    order_id  = int(parts[1].strip())
+                    new_items = parts[2].strip()
+                    success   = update_order_items(order_id, new_items)
                     if success:
                         if clean_msg:
                             send_whatsapp(phone, clean_msg)
-                        send_whatsapp(phone, f"✅ עדכנתי את ההזמנה #{order_id}!\n🛍️ מוצרים: {new_items}\n\nממתינים לאישור הבוס 😊")
+                        send_whatsapp(phone, f"✅ עדכנתי את ההזמנה #{order_id}!\n🛍️ {new_items}\n\nממתינים לאישור הבוס 😊")
                     else:
                         send_whatsapp(phone, "אופס, לא הצלחתי לעדכן. נסה שוב? 🙏")
                 except (ValueError, IndexError) as e:
                     log.error("UPDATE_ITEMS parse error: %s", e)
-                    send_whatsapp(phone, "לא הצלחתי לעדכן. תנסח שוב? 🙏")
 
         # ── UPDATE_ADDRESS ──
         elif "UPDATE_ADDRESS|" in bot_reply:
@@ -427,25 +449,26 @@ CANCEL_ORDER|{pending_order['id']}
                     if success:
                         if clean_msg:
                             send_whatsapp(phone, clean_msg)
-                        send_whatsapp(phone, f"✅ עדכנתי את הכתובת להזמנה #{order_id}:\n📍 {new_address}\n\nממתינים לאישור הבוס!")
+                        send_whatsapp(phone, f"✅ עדכנתי את הכתובת:\n📍 {new_address}\n\nממתינים לאישור הבוס!")
                     else:
                         send_whatsapp(phone, "אופס, לא הצלחתי לעדכן. נסה שוב? 🙏")
                 except (ValueError, IndexError) as e:
                     log.error("UPDATE_ADDRESS parse error: %s", e)
-                    send_whatsapp(phone, "לא הצלחתי לעדכן את הכתובת. תנסח שוב? 🙏")
 
-        # ── CANCEL_ORDER ──
+        # ── CANCEL_ORDER (עם סיבה) ──
         elif "CANCEL_ORDER|" in bot_reply:
             parts     = bot_reply.split("|")
             clean_msg = bot_reply.split("CANCEL_ORDER|")[0].strip()
             if len(parts) >= 2:
                 try:
                     order_id = int(parts[1].strip())
-                    success  = cancel_order_by_customer(order_id)
+                    # סיבה היא part[2] אם קיים
+                    reason   = parts[2].strip() if len(parts) >= 3 else "ביקוש לקוח"
+                    success  = cancel_order_by_customer(order_id, reason)
                     if clean_msg:
                         send_whatsapp(phone, clean_msg)
                     if success:
-                        send_whatsapp(phone, f"✅ ההזמנה #{order_id} בוטלה. אם תרצה להזמין שוב — אני כאן! 😊")
+                        send_whatsapp(phone, f"בסדר גמור 😊 ביטלתי את ההזמנה.\nאם תרצה להזמין שוב — אני כאן!")
                     else:
                         send_whatsapp(phone, "לא הצלחתי לבטל — יכול להיות שההזמנה כבר אושרה. צור קשר עם הבוס ישירות.")
                     clear_history(phone)
@@ -479,9 +502,9 @@ CANCEL_ORDER|{pending_order['id']}
                     order_id = save_order(name, phone, address, items, order_type)
                     if order_id:
                         if "איסוף" in order_type.lower():
-                            msg = f"פרפקט {name}! הזמנה #{order_id} התקבלה 📦\nמתחילים לארוז — נעדכן מתי לבוא 🛒\n\n💡 שכחת משהו? רוצה לשנות כתובת? פשוט כתוב לי!"
+                            msg = f"פרפקט {name}! הזמנה #{order_id} התקבלה 📦\nנעדכן מתי לבוא לאסוף 🛒\n\n💡 שכחת משהו? כתוב לי ואוסיף!"
                         else:
-                            msg = f"יופי {name}! הזמנה #{order_id} הועברה לבוס ⏳\nנעדכן כשהמשלוח ייצא 🛵\n\n💡 שכחת לציין מספר דירה? רוצה לשנות כתובת? פשוט כתוב לי!"
+                            msg = f"יופי {name}! הזמנה #{order_id} הועברה לבוס ⏳\nנעדכן כשהמשלוח ייצא 🛵\n\n💡 שכחת לציין מספר דירה? כתוב לי!"
                         send_whatsapp(phone, msg)
                         clear_history(phone)
                     else:
@@ -526,28 +549,22 @@ def receive_message():
         data = request.json
         if 'entry' not in data:
             return 'EVENT_RECEIVED', 200
-
         for entry in data.get('entry', []):
             for change in entry.get('changes', []):
                 value = change.get('value', {})
                 for msg in value.get('messages', []):
                     if msg.get('type') != 'text':
                         continue
-
                     msg_id = msg['id']
                     sender = msg['from']
                     text   = msg['text']['body']
-
                     if is_message_processed(msg_id):
                         log.info("Duplicate msg %s — skipping", msg_id)
                         continue
-
                     log.info("New msg from %s: %s", sender, text)
                     enqueue_message(sender, text)
-
     except Exception as e:
         log.error("Webhook error: %s", e)
-
     return 'EVENT_RECEIVED', 200
 
 
@@ -555,25 +572,18 @@ def receive_message():
 def send_update():
     if request.headers.get('X-Internal-Secret') != INTERNAL_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
-
     data    = request.json
     phone   = str(data.get('phone', '')).strip()
     message = data.get('message', '')
-
     if not phone or not message:
         return jsonify({"error": "Missing phone or message"}), 400
-
     success = send_whatsapp(phone, message)
     return (jsonify({"status": "sent"}), 200) if success else (jsonify({"error": "Failed"}), 500)
 
 
 @app.route('/')
 def home():
-    return jsonify({
-        "status":  "running",
-        "service": "WhatsApp Bot — המכולת של הצדיק",
-        "version": "5.1"
-    })
+    return jsonify({"status": "running", "service": "WhatsApp Bot — המכולת של הצדיק", "version": "5.2"})
 
 
 if __name__ == '__main__':
