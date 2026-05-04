@@ -112,16 +112,57 @@ def clear_history(phone: str) -> None:
 
 
 def get_inventory() -> str:
+    """
+    מחזיר רשימת מוצרים מדויקת מהמלאי.
+    חשוב: רק מה שרשום כאן קיים — הבוט לא יכול להמציא מוצרים או כמויות!
+    """
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute("SELECT name, price FROM products WHERE stock > 0 ORDER BY name")
         items = cur.fetchall()
         cur.close()
-        return ", ".join(f"{i[0]} ({i[1]}₪)" for i in items) if items else "המלאי כרגע ריק"
+        if not items:
+            return "המלאי כרגע ריק"
+        lines = [f"- {i[0]}: {i[1]}₪" for i in items]
+        return "\n".join(lines)
     except Exception as e:
         log.error("get_inventory error: %s", e)
         return "שגיאה בטעינת המלאי"
+    finally:
+        release_conn(conn)
+
+
+def get_approved_order(phone: str) -> dict | None:
+    """מחזיר הזמנה שאושרה על ידי הבעל הבית — נעולה לעריכה."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, customer_name, items, address, order_type, delivery_time
+            FROM orders
+            WHERE address LIKE %s AND status = 'אושר'
+            ORDER BY approved_at DESC
+            LIMIT 1
+            """,
+            (f"%WA_ID:{phone}%",)
+        )
+        row = cur.fetchone()
+        cur.close()
+        if row:
+            return {
+                "id":            row[0],
+                "customer_name": row[1],
+                "items":         row[2],
+                "address":       row[3],
+                "order_type":    row[4],
+                "delivery_time": row[5],
+            }
+        return None
+    except Exception as e:
+        log.error("get_approved_order error: %s", e)
+        return None
     finally:
         release_conn(conn)
 
@@ -154,39 +195,6 @@ def get_pending_order(phone: str) -> dict | None:
         return None
     except Exception as e:
         log.error("get_pending_order error: %s", e)
-        return None
-    finally:
-        release_conn(conn)
-
-
-def get_approved_order(phone: str) -> dict | None:
-    """מחזיר הזמנה שאושרה על ידי הבעל הבית — נעולה לעריכה."""
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, customer_name, items, address, order_type
-            FROM orders
-            WHERE address LIKE %s AND status = 'אושר'
-            ORDER BY approved_at DESC
-            LIMIT 1
-            """,
-            (f"%WA_ID:{phone}%",)
-        )
-        row = cur.fetchone()
-        cur.close()
-        if row:
-            return {
-                "id":            row[0],
-                "customer_name": row[1],
-                "items":         row[2],
-                "address":       row[3],
-                "order_type":    row[4],
-            }
-        return None
-    except Exception as e:
-        log.error("get_approved_order error: %s", e)
         return None
     finally:
         release_conn(conn)
@@ -361,7 +369,7 @@ def process_messages(phone: str) -> None:
     history   = get_history(phone)
     inventory = get_inventory()
 
-    # ── בדוק מצב הזמנות: אושרה? פתוחה? ──
+    # ── בדוק מצב הזמנות ──
     approved_order = get_approved_order(phone)
     pending_order  = get_pending_order(phone)
 
@@ -370,18 +378,17 @@ def process_messages(phone: str) -> None:
         # הזמנה אושרה על ידי הבעל הבית — נעולה!
         # ══════════════════════════════════════════
         addr_clean = approved_order['address'].split('|')[0].strip()
+        dt = approved_order.get('delivery_time') or ''
         pending_ctx = f"""
 🔒 ללקוח יש הזמנה שכבר אושרה על ידי הבעל הבית — היא נעולה לחלוטין!
   מספר הזמנה: #{approved_order['id']}
   מוצרים: {approved_order['items']}
   כתובת: {addr_clean}
   סוג: {approved_order['order_type']}
-  סטטוס: ✅ אושר — בדרך!
+  זמן משוער: {dt if dt else 'בקרוב'}
 
-אם הלקוח מנסה לשנות כתובת, להוסיף מוצרים, לבטל — אמור לו בנועם:
-"ההזמנה כבר אושרה ובדרך אליך, לא ניתן לשנות יותר 😊"
-
-אם הלקוח רוצה הזמנה חדשה (נוספת) — מותר! תמשיך בתהליך הזמנה רגיל.
+אם הלקוח מנסה לשנות / להוסיף / לבטל — אמור: "ההזמנה כבר אושרה ובדרך אליך, לא ניתן לשנות יותר 😊"
+אם הלקוח רוצה הזמנה נוספת חדשה — מותר, תמשיך בתהליך רגיל.
 """
 
     elif pending_order:
@@ -390,57 +397,55 @@ def process_messages(phone: str) -> None:
         # ══════════════════════════════════════════
         address_clean = pending_order['address'].split('|')[0].strip()
         pending_ctx = f"""
-ℹ️ ללקוח יש הזמנה פתוחה שממתינה לאישור הבעל הבית (הלקוח לא מאשר — הבעל הבית מאשר!):
+ℹ️ ללקוח יש הזמנה פתוחה שממתינה לאישור הבעל הבית:
   מספר הזמנה: #{pending_order['id']}
-  שם: {pending_order['customer_name']}
   מוצרים כרגע: {pending_order['items']}
   כתובת: {address_clean}
   סוג: {pending_order['order_type']}
 
-מה הלקוח יכול לעשות:
+✅ להוסיף מוצרים — ציין: "מוסיף לך [X] להזמנה הקיימת!" ורשום:
+UPDATE_ITEMS|{pending_order['id']}|[כל המוצרים: הישנים + החדשים]
 
-✅ להוסיף מוצרים לאותה הזמנה — אם הלקוח מבקש להוסיף, אמור לו: "מוסיף לך X להזמנה הקיימת!" ורשום:
-UPDATE_ITEMS|{pending_order['id']}|[רשימה מלאה — הישנים + החדשים]
+✅ לשנות כתובת — רשום:
+UPDATE_ADDRESS|{pending_order['id']}|[כתובת מלאה]
 
-✅ לשנות כתובת / מספר דירה / קומה / כניסה — רשום:
-UPDATE_ADDRESS|{pending_order['id']}|[הכתובת המלאה החדשה]
+✅ לבטל — נסה לשכנע פעם אחת בלבד. אם מסרב — רשום:
+CANCEL_ORDER|{pending_order['id']}
 
-✅ לבטל — אבל קודם נסה לשכנע פעם אחת בלבד!
-   שכנוע: "בטוח? יש לנו [מוצר רלוונטי] שאולי שכחת 😊"
-   אם הלקוח עדיין מסרב — שחרר מיד ורשום:
-   CANCEL_ORDER|{pending_order['id']}
-
-✅ הזמנה נוספת — מותר לחלוטין. תמשיך בתהליך הזמנה רגיל.
-
-חשוב: כשאתה מוסיף מוצר, ציין במפורש: "הוספתי לך [מוצר] להזמנה הקיימת #{pending_order['id']} 😊"
+✅ הזמנה נוספת — מותר לחלוטין.
 """
 
     else:
-        # ══════════════════════════════════════════
-        # אין הזמנה — קניות רגילות
-        # ══════════════════════════════════════════
-        pending_ctx = "אין הזמנות פתוחות ללקוח זה — ניתן לקבל הזמנה חדשה."
+        pending_ctx = "אין הזמנות פתוחות — ניתן לקבל הזמנה חדשה."
 
     system_prompt = f"""אתה "חיים", המוכר האדיב במכולת "המכולת של הצדיק".
-המלאי: {inventory}
+
+המלאי הזמין — אלו המוצרים היחידים שיש, אל תמציא מוצרים או כמויות שלא כתובות כאן:
+{inventory}
 
 {pending_ctx}
 
-חוקים:
-1. ענה בעברית פשוטה וטבעית — היה חם ואנושי.
+חוקים קריטיים:
+1. ענה בעברית פשוטה וטבעית.
 2. ענה על הכל בתשובה אחת בלבד.
-3. אל תחזור על עצמך.
-4. לעולם אל תגיד ללקוח שהוא "לא יכול" לעשות הזמנה חדשה — הוא תמיד יכול!
+3. אל תמציא מוצרים, כמויות, מחירים — רק מה שכתוב במלאי למעלה!
+4. זכור את כל המוצרים שהלקוח ביקש במהלך השיחה — אל תשכח מוצר שנאמר קודם.
+5. אחרי FINAL_ORDER — תמיד כתוב שההזמנה ממתינה לאישור הבעל הבית.
 
 🚨 תלונות (מגעיל / רקוב / קרוע / זבל):
 - התנצל, אל תציע קניות
 - רשום: FINAL_COMPLAINT|{phone}|[שם]|[תיאור]
 
-🛒 קניות (גם אם יש הזמנה פתוחה — מותר!):
-שלב 1 — בחירת מוצרים → "תרצה להוסיף עוד משהו?"
-שלב 2 — כשסיים → "משלוח 🛵 או איסוף 🛒?"
-שלב 3 — פרטים: משלוח=שם+עיר+רחוב+מספר בית, איסוף=שם בלבד
-שלב 4 — כשיש שם מלא → FINAL_ORDER|{phone}|[שם]|[כתובת/איסוף]|[מוצרים]|[סוג]"""
+🛒 קניות — שלבים מדויקים:
+שלב 1 — בחירת מוצרים: שאל "תרצה להוסיף עוד משהו?" אחרי כל הוספה.
+         זכור את כל מה שביקש! אם אמר "לחם" בהתחלה — לחם נשאר ברשימה.
+שלב 2 — כשסיים (אמר "לא"/"זהו"/"סיימתי") → שאל: "משלוח 🛵 או איסוף 🛒?"
+שלב 3 — פרטים: משלוח=שם מלא+עיר+רחוב+מספר בית, איסוף=שם מלא בלבד
+שלב 4 — כשיש שם מלא → FINAL_ORDER|{phone}|[שם]|[כתובת/איסוף]|[כל המוצרים]|[סוג]
+
+חשוב בשלב 4: אחרי שתרשום FINAL_ORDER, הוסף הודעה ללקוח:
+"ההזמנה התקבלה! ⏳ ממתינה לאישור הבעל הבית — תקבל הודעה ברגע שיאשר 😊"
+"""
 
     if not groq_client:
         send_whatsapp(phone, f"שלום! המלאי שלנו:\n{inventory}")
@@ -540,9 +545,9 @@ UPDATE_ADDRESS|{pending_order['id']}|[הכתובת המלאה החדשה]
                     order_id = save_order(name, phone, address, items, order_type)
                     if order_id:
                         if "איסוף" in order_type.lower():
-                            msg = f"פרפקט {name}! הזמנה #{order_id} התקבלה 📦\nמתחילים לארוז — נעדכן מתי לבוא 🛒\n\n💡 שכחת משהו? רוצה לשנות כתובת? פשוט כתוב לי!"
+                            msg = f"מעולה {name}! הזמנה #{order_id} התקבלה ⏳\n🛍️ {items}\n\nממתינה לאישור הבעל הבית — תקבל הודעה ברגע שיאשר 😊\n\n💡 שכחת משהו? כתוב לי ואוסיף!"
                         else:
-                            msg = f"יופי {name}! הזמנה #{order_id} הועברה לבוס ⏳\nנעדכן כשהמשלוח ייצא 🛵\n\n💡 שכחת לציין מספר דירה? רוצה לשנות כתובת? פשוט כתוב לי!"
+                            msg = f"מעולה {name}! הזמנה #{order_id} התקבלה ⏳\n🛍️ {items}\n📍 {address}\n\nממתינה לאישור הבעל הבית — תקבל הודעה ברגע שיאשר 😊\n\n💡 שכחת לציין מספר דירה? כתוב לי!"
                         send_whatsapp(phone, msg)
                         clear_history(phone)
                     else:
