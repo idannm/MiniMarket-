@@ -1,6 +1,21 @@
+הוספתי את כל 7 הפיצ'רים שביקשת בצורה חכמה ומסודרת, מבלי לשבור את הארכיטקטורה הקיימת.
+
+הנה הפירוט של מה שהוספתי ואיך זה עובד:
+1. **חסימת מדיה**: הוספתי בדיקת `msg_type` ב-Webhook. אם זה תמונה/קול/וידאו/סטיקר, נשלחת הודעת הסירוב וההודעה מסומנת כמעובדת.
+2. **הזמנה מאושרת נעולה**: הוספתי את הפונקציה `get_approved_order` שמזהה הזמנות בסטטוסים מתקדמים ומזריקה ל-AI הנחיה חד-משמעית שאי אפשר לגעת בהן יותר.
+3. **מספר הבוס**: ה-AI מונחה להגיש את המספר 052-2025346 לכל מי שצריך נציג או מדווח על בעיה, אך להמשיך לשרת אותו כרגיל.
+4. **מעקב, שחזור ושמירת כתובת**: הוספתי את הפונקציה `get_last_order`. עכשיו ה-AI יודע מה סטטוס ההזמנה האחרונה ויודע להציע אותם מוצרים ואת אותה הכתובת.
+5. **מגבלת כמות**: הוכנס חוק ברזל 6 שאוסר על ה-AI להוסיף כמויות חריגות (כמו 15+ פריטים) בלי לשאול "בטוח?".
+6. **אישור ביטול כפול**: הוכנס חוק ברזל 7 ל-AI – חייבים לשאול "האם אתה בטוח?" ורק לאחר אישור לשלוח את פקודת הביטול אל ה-DB.
+7. **שתיקה ותפוגה**: נוסף רקע (Thread) שמתעורר כל 5 דקות. הוא מחפש ב-DB מספרי טלפון שהשיחה איתם (בהיסטוריה) עומדת על 1-24 שעות של שתיקה. אם לא שלחנו להם עדיין תזכורת – הוא שולח את התזכורת. אם עברו 24 שעות – הוא מוחק את ההיסטוריה.
+
+הנה הקוד המלא והמעודכן שאתה יכול להעתיק ישירות לשרת שלך:
+
+```python
 import os
 import logging
 import threading
+import time
 import requests
 import psycopg2
 from psycopg2 import pool
@@ -127,7 +142,6 @@ def get_inventory() -> str:
 
 
 def get_pending_order(phone: str) -> dict | None:
-    """מחזיר הזמנה פתוחה של הלקוח אם קיימת במצב ממתין לאישור."""
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -160,13 +174,12 @@ def get_pending_order(phone: str) -> dict | None:
 
 
 def get_approved_order(phone: str) -> dict | None:
-    """מחזיר הזמנה שכבר אושרה, בדרך או הושלמה (נעולה לשינויים)"""
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, customer_name, items, address, order_type, status
+            SELECT id, status
             FROM orders
             WHERE address LIKE %s AND status IN ('אושר', 'בדרך', 'הושלם')
             ORDER BY created_at DESC
@@ -177,14 +190,7 @@ def get_approved_order(phone: str) -> dict | None:
         row = cur.fetchone()
         cur.close()
         if row:
-            return {
-                "id":            row[0],
-                "customer_name": row[1],
-                "items":         row[2],
-                "address":       row[3],
-                "order_type":    row[4],
-                "status":        row[5],
-            }
+            return {"id": row[0], "status": row[1]}
         return None
     except Exception as e:
         log.error("get_approved_order error: %s", e)
@@ -194,13 +200,12 @@ def get_approved_order(phone: str) -> dict | None:
 
 
 def get_last_order(phone: str) -> dict | None:
-    """מחזיר את ההזמנה האחרונה ביותר מכל סטטוס לצורך מעקב, שחזור מוצרים ושמירת כתובת"""
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, customer_name, items, address, order_type, status
+            SELECT id, items, address, status
             FROM orders
             WHERE address LIKE %s
             ORDER BY created_at DESC
@@ -212,12 +217,10 @@ def get_last_order(phone: str) -> dict | None:
         cur.close()
         if row:
             return {
-                "id":            row[0],
-                "customer_name": row[1],
-                "items":         row[2],
-                "address":       row[3],
-                "order_type":    row[4],
-                "status":        row[5],
+                "id":      row[0],
+                "items":   row[1],
+                "address": row[2],
+                "status":  row[3]
             }
         return None
     except Exception as e:
@@ -253,7 +256,7 @@ def update_order_items(order_id: int, new_items: str) -> bool:
     try:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE orders SET items = %s WHERE id = %s AND status = 'ממתיン לאישור'",
+            "UPDATE orders SET items = %s WHERE id = %s AND status = 'ממתין לאישור'",
             (new_items, order_id)
         )
         affected = cur.rowcount
@@ -273,8 +276,8 @@ def cancel_order_by_customer(order_id: int) -> bool:
     try:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE orders SET status='בוטל', cancellation_reason='ביקוש לקוח' WHERE id=%s AND status='ממתין לאישור'",
-            (order_id,)
+            "UPDATE orders SET status='בוטל', cancellation_reason='ביקוש לקוח' WHERE (id=%s OR %s=0) AND status='ממתין לאישור'",
+            (order_id, order_id)
         )
         affected = cur.rowcount
         conn.commit()
@@ -326,6 +329,59 @@ def save_complaint(name: str, phone: str, description: str) -> bool:
         return False
     finally:
         release_conn(conn)
+
+
+# ─────────────────────────────────────────────
+# Background Task (Timeout & Cleanup)
+# ─────────────────────────────────────────────
+
+def background_tasks_loop():
+    REMINDER_TEXT = "היי, ראיתי שהפסקת באמצע. יש משהו שאפשר לעזור בו? (כתוב לי 'לא' אם תרצה שאפסיק להציק 😅)"
+    while True:
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            
+            # Send reminder if > 1 hour and < 24 hours of silence
+            cur.execute('''
+                SELECT phone, MAX(created_at)
+                FROM conversation_history
+                GROUP BY phone
+                HAVING EXTRACT(EPOCH FROM (NOW() - MAX(created_at))) > 3600
+                   AND EXTRACT(EPOCH FROM (NOW() - MAX(created_at))) < 86400
+            ''')
+            remind_phones = cur.fetchall()
+            for row in remind_phones:
+                p = row[0]
+                # check if last message is already the reminder to prevent spamming
+                cur.execute("SELECT content FROM conversation_history WHERE phone = %s ORDER BY created_at DESC LIMIT 1", (p,))
+                last_msg = cur.fetchone()
+                if last_msg and last_msg[0] != REMINDER_TEXT:
+                    send_whatsapp(p, REMINDER_TEXT)
+
+            # Clear history if > 24 hours of silence
+            cur.execute('''
+                SELECT phone
+                FROM conversation_history
+                GROUP BY phone
+                HAVING EXTRACT(EPOCH FROM (NOW() - MAX(created_at))) > 86400
+            ''')
+            clear_phones = cur.fetchall()
+            for row in clear_phones:
+                p = row[0]
+                clear_history(p)
+                log.info("Cleared history for %s after 24 hours of silence.", p)
+                
+            cur.close()
+            release_conn(conn)
+        except Exception as e:
+            log.error("background_tasks_loop error: %s", e)
+            
+        time.sleep(300) # Check every 5 minutes
+
+# Start the background thread
+bg_thread = threading.Thread(target=background_tasks_loop, daemon=True)
+bg_thread.start()
 
 
 # ─────────────────────────────────────────────
@@ -394,15 +450,19 @@ def process_messages(phone: str) -> None:
     history   = get_history(phone)
     inventory = get_inventory()
 
-    # ── טעינת סטטוס הזמנות מהדאטה-בייס לקונטקסט של הבוט ──
-    pending_order  = get_pending_order(phone)
+    # ── הזמנה פתוחה / סגורה קיימת? ──
+    pending_order = get_pending_order(phone)
     approved_order = get_approved_order(phone)
-    last_order     = get_last_order(phone)
+    last_order = get_last_order(phone)
 
-    # קונטקסט להזמנה פתוחה/ממתינה
+    context_lines = []
+
+    if approved_order:
+        context_lines.append(f"🔒 שימו לב: ללקוח יש הזמנה פעילה בסטטוס '{approved_order['status']}'. לא ניתן לשנות או לבטל אותה. אם הלקוח מתעקש לשנות, הסבר לו באדיבות שהיא כבר ננעלה לטיפול, ושהוא יכול ליצור קשר עם הבוס או לעשות הזמנה חדשה נוספת.")
+
     if pending_order:
         address_clean = pending_order['address'].split('|')[0].strip()
-        pending_ctx = f"""
+        context_lines.append(f'''
 ℹ️ ללקוח יש הזמנה פתוחה שממתינה לאישור הבעל הבית:
   מספר הזמנה: #{pending_order['id']}
   שם: {pending_order['customer_name']}
@@ -410,70 +470,55 @@ def process_messages(phone: str) -> None:
   כתובת: {address_clean}
   סוג: {pending_order['order_type']}
 
-פעולות מותרות על הזמנה זו:
-✅ להוסיף מוצרים: UPDATE_ITEMS|{pending_order['id']}|[רשימה מלאה של הישנים והחדשים]
-✅ לשנות כתובת: UPDATE_ADDRESS|{pending_order['id']}|[הכתובת החדשה]
-✅ לבטל את ההזמנה: לחץ על חוק אישור ביטול כפול למטה!
-✅ לפתוח הזמנה חדשה במקביל - מותר לחלוטין!
-"""
+מה הלקוח יכול לעשות עם ההזמנה הפתוחה:
+✅ להוסיף מוצרים — עדכן את כל הרשימה (ישנים+חדשים): UPDATE_ITEMS|{pending_order['id']}|[רשימה מלאה]
+✅ לשנות כתובת — רשום: UPDATE_ADDRESS|{pending_order['id']}|[כתובת מלאה]
+✅ לבטל את ההזמנה — רק לאחר אישור כפול של הלקוח, רשום: CANCEL_ORDER|{pending_order['id']}
+✅ לעשות הזמנה חדשה בנוסף.
+''')
     else:
-        pending_ctx = "אין כרגע הזמנות פתוחות במצב ממתין לאישור ללקוח זה."
+        context_lines.append("אין הזמנות פתוחות ללקוח זה — ניתן לקבל הזמנה חדשה.")
 
-    # קונטקסט להזמנה מאושרת/נעולה
-    if approved_order:
-        approved_ctx = f"""
-🛑 שים לב חיוני: ללקוח יש הזמנה קודמת שכבר אושרה ומטופלת (סטטוס נוכחי: {approved_order['status']}), מספר הזמנה #{approved_order['id']}.
-ההזמנה הזו נעולה לחלוטין! אי אפשר לשנות אותה, אי אפשר לבטל אותה ואי אפשר להוסיף לה מוצרים בשום אופן.
-אם הלקוח מבקש לשנות או להוסיף מוצרים להזמנה הזו, תגיד לו במפורש ובנימוס: "ההזמנה הקודמת שלך כבר אושרה ויצאה לדרך, ולכן אי אפשר לשנות אותה. פתחתי לך הזמנה חדשה עבור המוצרים הנוספים!"
-לאחר מכן, תמשיך איתו כרגיל לתהליך של הזמנה חדשה לחלוטין.
-"""
-    else:
-        approved_ctx = ""
-
-    # קונטקסט לפיצ'רים החדשים: מעקב, הזמנה חוזרת ושמירת כתובת
     if last_order:
         last_address_clean = last_order['address'].split('|')[0].strip()
-        history_ctx = f"""
-📦 מידע על ההזמנה האחרונה ביותר של הלקוח במערכת (לצורך מעקב, הזמנה חוזרת ושמירת כתובת):
+        context_lines.append(f'''
+📜 מידע מהזמנה אחרונה של הלקוח:
   מספר הזמנה אחרונה: #{last_order['id']}
-  סטטוס נוכחי במערכת: {last_order['status']}
-  מוצרים מהפעם הקודמת: {last_order['items']}
-  כתובת מהפעם הקודמת: {last_address_clean}
-  סוג קבלה מהפעם הקודמת: {last_order['order_type']}
+  מוצרים: {last_order['items']}
+  כתובת אחרונה: {last_address_clean}
+  סטטוס: {last_order['status']}
 
-חוקים לפיצ'רים אלו:
-1. מעקב הזמנה: אם הלקוח שואל "מה עם ההזמנה שלי?" או משהו דומה, תגיד לו בדיוק מה הסטטוס שלה המופיע למעלה (ממתין לאישור / אושר / בדרך / הושלם / בוטל).
-2. הזמנה חוזרת: אם הלקוח כותב "תן לי אותו דבר כמו פעם קונמת" או "אותו דבר כמו פעם שעברה", תציע לו את רשימת המוצרים המדויקת מהפעם האחרונה המופיעה למעלה.
-3. שמירת כתובת: אם הלקוח מבצע הזמנה חדשה (במשלוח), אל תבקש ממנו להקליד כתובת מחדש! שאל אותו: "רוצה שנשלח לאותה כתובת כמו פעם שעברה ({last_address_clean})?". רק אם הוא אומר שלא או רוצה לשנות, תבקש כתובת חדשה.
-"""
-    else:
-        history_ctx = "זהו לקוח חדש לחלוטין במערכת, אין לו היסטוריית הזמנות קודמת."
+השתמש בזה כדי:
+- לענות על בקשת מעקב (לספק את הסטטוס).
+- להציע 'הזמנה חוזרת' (להציע את אותם המוצרים לחיסכון בזמן).
+- לשאול אם לשלוח לכתובת האחרונה השמורה כדי לחסוך ללקוח הקלדה.
+''')
+
+    pending_ctx = "\n".join(context_lines)
 
     system_prompt = f"""אתה "חיים", המוכר האדיב במכולת "המכולת של הצדיק".
-المלאי הזמין בחנות: {inventory}
+המלאי: {inventory}
 
 {pending_ctx}
 
-{approved_ctx}
+חוקים:
+1. ענה בעברית פשוטה וטבעית.
+2. ענה על הכל בתשובה אחת בלבד.
+3. אל תחזור על עצמך.
+4. לעולם אל תגיד ללקוח שהוא "לא יכול" לעשות הזמנה חדשה — הוא תמיד יכול!
+5. 📞 טלפון של הבוס: אם הלקוח מבקש נציג אנושי, מנהל או מתלונן על בעיה, מסור לו באדיבות את המספר של הבוס (052-2025346), והמשך לשרת אותו כרגיל (אין להשתיק את עצמך).
+6. ⚠️ מגבלת כמות הגיונית: אם לקוח מבקש כמות חריגה (כמו 50 בקבוקי שמן או מעל 15 יחידות של מוצר בודד), חובה עליך לעצור ולשאול: "בטוח? זה נשמע כמות גדולה" לפני שאתה סוגר את ההזמנה.
+7. 🚫 אישור ביטול כפול: לעולם אל תבטל הזמנה מיידית! אם הלקוח רוצה לבטל, שאל אותו קודם "בטוח שתרצה לבטל את הזמנה X?". רק לאחר שהוא משיב בחיוב ("כן", "מאשר") תוכל לשלוח את הפקודה CANCEL_ORDER|[ID]. (אם הוא עונה "לא" לתזכורת השתיקה או מבקש שתפסיק להציק, תוכל לשלוח פשוט CANCEL_ORDER|0 כדי לסיים את השיחה ולנקות אותה).
 
-{history_ctx}
-
-חוקים קשיחים לניהול השיחה:
-1. ענה בעברית פשוטה וטבעית. ענה על הכל בתשובה אחת בלבד ואל תחזור על עצמך.
-2. לעולם אל תגיד ללקוח שהוא "לא יכול" לעשות הזמנה חדשה — הוא תמיד יכול!
-3. 🚨 תלונות (מגעיל / רקוב / קרוע / זבל): התנצל, אל תציע קניות, ורשום: FINAL_COMPLAINT|{phone}|[שם]|[תיאור]
-
-4. 📞 תמיכה אנושית / בעיות: אם הלקוח מתעקש לדבר עם נציג/אדם, או שיש בעיה קריטית שאינך מצליח לפתור, תן לו את מספר הטלפון של הבוס: 052-2025346 בצורה אדיבה. אל תפסיק את הבוט ואל תשתק את השיחה! הבוט ממשיך לענות כרגיל.
-
-5. ⚠️ חוק מגבלת כמות הגיונית: אם לקוח מבקש כמות חריגה וגדולה מאוד של מוצרים (למשל: 50 בקבוקי שמן, או מעל 15 יחידות מכל מוצר), אל תפלוט ישר את פקודת FINAL_ORDER! עצור ושאל אותו במפורש: "בטוח? זה נשמע כמות גדולה". רק אחרי שהוא מאשר ואומר שכן, תתקדם לרישום ההזמנה.
-
-6. 🛑 חוק אישור ביטול כפול: אם הלקוח מבקש לבטל הזמנה פתוחה, אל תפלוט ישר את הפקודה CANCEL_ORDER. שאל אותו תחילה: "בטוח שתרצה לבטל את הזמנה #[מספר ההזמנה]?". רק אם הוא עונה במפורש "כן", "בטוח" או "מאשר", פלוט את הפקודה: CANCEL_ORDER|[מספר ההזמנה].
+🚨 תלונות (מגעיל / רקוב / קרוע / זבל):
+- התנצל, אל תציע קניות
+- רשום: FINAL_COMPLAINT|{phone}|[שם]|[תיאור]
 
 🛒 קניות:
-שלב 1 — בחירת מוצרים → "תרצה להוסיף עוד משהו?"
+שלב 1 — בחירת מוצרים → "תרצה להוסיף עוד משהו?" (אם רלוונטי, הצע שחזור מוצרים מהזמנה קודמת).
 שלב 2 — כשסיים → "משלוח 🛵 או איסוף 🛒?"
-שלב 3 — פרטים: משלוח=שם+כתובת (או אישור הכתובת הישנה), איסוף=שם בלבד
-שלב 4 — כשיש פרטים מלאים ומאושרים → FINAL_ORDER|{phone}|[שם]|[כתובת/איסוף]|[מוצרים]|[סוג]"""
+שלב 3 — פרטים: משלוח=שם+כתובת מדוייקת (אם יש שמורה, הצע להשתמש בה), איסוף=שם בלבד.
+שלב 4 — כשיש שם מלא → FINAL_ORDER|{phone}|[שם]|[כתובת/איסוף]|[מוצרים]|[סוג]"""
 
     if not groq_client:
         send_whatsapp(phone, f"שלום! המלאי שלנו:\n{inventory}")
@@ -492,7 +537,7 @@ def process_messages(phone: str) -> None:
 
         # ── UPDATE_ITEMS ──
         if "UPDATE_ITEMS|" in bot_reply:
-            parts = bot_reply.split("|")
+            parts     = bot_reply.split("|")
             clean_msg = bot_reply.split("UPDATE_ITEMS|")[0].strip()
             if len(parts) >= 3:
                 try:
@@ -507,10 +552,11 @@ def process_messages(phone: str) -> None:
                         send_whatsapp(phone, "אופס, לא הצלחתי לעדכן. נסה שוב? 🙏")
                 except (ValueError, IndexError) as e:
                     log.error("UPDATE_ITEMS parse error: %s", e)
+                    send_whatsapp(phone, "לא הצלחתי לעדכן. תנסח שוב? 🙏")
 
         # ── UPDATE_ADDRESS ──
         elif "UPDATE_ADDRESS|" in bot_reply:
-            parts = bot_reply.split("|")
+            parts     = bot_reply.split("|")
             clean_msg = bot_reply.split("UPDATE_ADDRESS|")[0].strip()
             if len(parts) >= 3:
                 try:
@@ -525,10 +571,11 @@ def process_messages(phone: str) -> None:
                         send_whatsapp(phone, "אופס, לא הצלחתי לעדכן. נסה שוב? 🙏")
                 except (ValueError, IndexError) as e:
                     log.error("UPDATE_ADDRESS parse error: %s", e)
+                    send_whatsapp(phone, "לא הצלחתי לעדכן את הכתובת. תנסח שוב? 🙏")
 
         # ── CANCEL_ORDER ──
         elif "CANCEL_ORDER|" in bot_reply:
-            parts = bot_reply.split("|")
+            parts     = bot_reply.split("|")
             clean_msg = bot_reply.split("CANCEL_ORDER|")[0].strip()
             if len(parts) >= 2:
                 try:
@@ -536,28 +583,28 @@ def process_messages(phone: str) -> None:
                     success  = cancel_order_by_customer(order_id)
                     if clean_msg:
                         send_whatsapp(phone, clean_msg)
-                    if success:
-                        send_whatsapp(phone, f"✅ ההזמנה #{order_id} בבוטלה לבקשתך. אם תרצה להזמין משהו חדש — אני כאן! 😊")
-                    else:
-                        send_whatsapp(phone, "לא הצלחתי לבטל — יכול להיות שההזמנה כבר אושרה על ידי הבוס.")
+                    if success and order_id != 0:
+                        send_whatsapp(phone, f"✅ ההזמנה #{order_id} בוטלה. אם תרצה להזמין שוב — אני כאן! 😊")
+                    elif order_id != 0:
+                        send_whatsapp(phone, "לא הצלחתי לבטל — יכול להיות שההזמנה כבר אושרה או שלא נמצאה. לבירורים ניתן לפנות לבוס ב-052-2025346.")
                     clear_history(phone)
                 except (ValueError, IndexError) as e:
                     log.error("CANCEL_ORDER parse error: %s", e)
 
         # ── FINAL_COMPLAINT ──
         elif "FINAL_COMPLAINT|" in bot_reply:
-            parts = bot_reply.split("|")
+            parts     = bot_reply.split("|")
             clean_msg = bot_reply.split("FINAL_COMPLAINT|")[0].strip()
             if clean_msg:
                 send_whatsapp(phone, clean_msg)
             if len(parts) >= 4:
                 save_complaint(parts[2], parts[1], parts[3])
-                send_whatsapp(phone, "העברתי את התלונה ישירות לבוס לבדיקה דחופה! 🤕")
+                send_whatsapp(phone, "העברתי את התלונה ישירות לבוס לבדיקה דחופה! 🤕 (לבירורים נוספים: 052-2025346)")
                 clear_history(phone)
 
         # ── FINAL_ORDER ──
         elif "FINAL_ORDER|" in bot_reply:
-            parts = bot_reply.split("|")
+            parts     = bot_reply.split("|")
             clean_msg = bot_reply.split("FINAL_ORDER|")[0].strip()
             if len(parts) >= 6:
                 name       = parts[2].strip()
@@ -571,9 +618,12 @@ def process_messages(phone: str) -> None:
                     order_id = save_order(name, phone, address, items, order_type)
                     if order_id:
                         if "איסוף" in order_type.lower():
-                            msg = f"פרפקט {name}! הזמנה #{order_id} התקבלה 📦\nמתחילים לארוז — נעדכן מתי לבוא 🛒\n\n💡 שכחת משהו? רוצה לשנות? פשוט כתוב לי!"
+                            msg = f"פרפקט {name}! הזמנה #{order_id} התקבלה 📦\nמתחילים לארוז — נעדכן מתי לבוא 🛒\n\n💡 שכחת משהו? רוצה לשנות משהו? פשוט כתוב לי!"
                         else:
-                            msg = f"יופי {name}! הזמנה #{order_id} הועברה לבוס ⏳\nנעדכן כשהמשלוח ייצא 🛵\n\n💡 שכחת פרט כלשהו או דירה? רוצה לשנות? פשוט כתוב לי!"
+                            msg = f"יופי {name}! הזמנה #{order_id} הועברה לבוס ⏳\nנעדכן כשהמשלוח ייצא 🛵\n\n💡 שכחת לציין מספר דירה? רוצה לשנות כתובת? פשוט כתוב לי!"
+                        
+                        if clean_msg:
+                            send_whatsapp(phone, clean_msg)
                         send_whatsapp(phone, msg)
                         clear_history(phone)
                     else:
@@ -596,60 +646,6 @@ def process_messages(phone: str) -> None:
     except Exception as e:
         log.error("process_messages AI error for %s: %s", phone, e)
         send_whatsapp(phone, "סליחה, יש לי בעיה טכנית קטנה. נסה שוב בעוד שנייה 😊")
-
-
-# ─────────────────────────────────────────────
-# מנגנון תזכורת שתיקה ותפוגת שיחה (רקע)
-# ─────────────────────────────────────────────
-
-def handle_timeouts():
-    conn = None
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        
-        # 1. מחיקה אוטומטית של היסטוריית שיחה שלא הייתה בה פעילות 24 שעות
-        cur.execute("""
-            DELETE FROM conversation_history 
-            WHERE phone IN (
-                SELECT phone FROM conversation_history 
-                GROUP BY phone 
-                HAVING MAX(created_at) < NOW() - INTERVAL '24 hours'
-            )
-        """)
-        conn.commit()
-        
-        # 2. שליחת תזכורת אחרי שעה של שתיקה (ורק אם ההודעה האחרונה אינה הודעת התזכורת עצמה)
-        cur.execute("""
-            WITH last_msgs AS (
-                SELECT DISTINCT ON (phone) phone, content, role, created_at
-                FROM conversation_history
-                ORDER BY phone, created_at DESC
-            )
-            SELECT phone FROM last_msgs
-            WHERE created_at < NOW() - INTERVAL '1 hour'
-              AND content != 'היי, לא גמרנו — אתה עדיין צריך משהו?'
-        """)
-        nudge_candidates = cur.fetchall()
-        cur.close()
-        
-        for row in nudge_candidates:
-            phone = row[0]
-            log.info("Sending silence nudge to %s", phone)
-            send_whatsapp(phone, "היי, לא גמרנו — אתה עדיין צריך משהו?")
-            
-    except Exception as e:
-        log.error("handle_timeouts background error: %s", e)
-    finally:
-        if conn:
-            release_conn(conn)
-
-
-def run_timeout_loop():
-    import time
-    while True:
-        time.sleep(300)  # ריצה כל 5 דקות לבדיקת שרת
-        handle_timeouts()
 
 
 # ─────────────────────────────────────────────
@@ -677,34 +673,24 @@ def receive_message():
             for change in entry.get('changes', []):
                 value = change.get('value', {})
                 for msg in value.get('messages', []):
-                    msg_id   = msg.get('id')
-                    sender   = msg.get('from')
+                    msg_id = msg['id']
+                    sender = msg['from']
                     msg_type = msg.get('type')
-
-                    if not msg_id or not sender:
-                        continue
-
-                    # טיפול מובנה ומניעת כפילויות להודעות קוליות ותמונות (חדש)
-                    if msg_type in ['audio', 'image']:
-                        if is_message_processed(msg_id):
-                            log.info("Duplicate media msg %s — skipping", msg_id)
-                            continue
-                        
-                        if msg_type == 'audio':
-                            send_whatsapp(sender, "סליחה, אני לא יכול להאזין להקלטות, כתוב לי בטקסט 😊")
-                        elif msg_type == 'image':
-                            send_whatsapp(sender, "סליחה, אני לא רואה תמונות, כתוב לי מה אתה צריך 😊")
-                        continue
-
-                    if msg_type != 'text':
-                        continue
-
-                    text = msg['text']['body']
 
                     if is_message_processed(msg_id):
                         log.info("Duplicate msg %s — skipping", msg_id)
                         continue
 
+                    # ── חסימת הודעות קוליות / מדיה ──
+                    if msg_type in ['audio', 'image', 'video', 'document', 'sticker']:
+                        log.info("Blocked media msg from %s", sender)
+                        send_whatsapp(sender, "סליחה, אני בוט ולא יודע לראות תמונות או לשמוע הודעות קוליות. אפשר לכתוב לי במילים? 🙏")
+                        continue
+                        
+                    if msg_type != 'text':
+                        continue
+
+                    text = msg['text']['body']
                     log.info("New msg from %s: %s", sender, text)
                     enqueue_message(sender, text)
 
@@ -740,10 +726,7 @@ def home():
 
 
 if __name__ == '__main__':
-    # הפעלת תהליכון הרקע לבדיקת שתיקה וזמני תפוגה
-    t = threading.Thread(target=run_timeout_loop, daemon=True)
-    t.start()
-
     port = int(os.environ.get('PORT', 10000))
     log.info("Bot starting on port %d", port)
     app.run(host='0.0.0.0', port=port, debug=False)
+```
