@@ -112,8 +112,9 @@ def clear_history(phone: str) -> None:
 
 
 def get_inventory() -> str:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn() # עכשיו זה מוגן בפנים!
         cur = conn.cursor()
         cur.execute("SELECT name, price FROM products WHERE stock > 0 ORDER BY name")
         items = cur.fetchall()
@@ -123,8 +124,8 @@ def get_inventory() -> str:
         log.error("get_inventory error: %s", e)
         return "שגיאה בטעינת המלאי"
     finally:
-        release_conn(conn)
-
+        if conn:
+            release_conn(conn)
 
 def get_pending_order(phone: str) -> dict | None:
     """מחזיר הזמנה פתוחה של הלקוח אם קיימת."""
