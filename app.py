@@ -43,8 +43,9 @@ debounce_lock = threading.Lock()
 # ─────────────────────────────────────────────
 
 def is_message_processed(message_id: str) -> bool:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO processed_messages (message_id) VALUES (%s) ON CONFLICT (message_id) DO NOTHING RETURNING id",
@@ -56,15 +57,18 @@ def is_message_processed(message_id: str) -> bool:
         return inserted is None
     except Exception as e:
         log.error("is_message_processed error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return True
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def save_message(phone: str, role: str, content: str) -> None:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO conversation_history (phone, role, content) VALUES (%s, %s, %s)",
@@ -74,14 +78,17 @@ def save_message(phone: str, role: str, content: str) -> None:
         cur.close()
     except Exception as e:
         log.error("save_message error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def get_history(phone: str, limit: int = 8) -> list[dict]:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "SELECT role, content FROM conversation_history WHERE phone = %s ORDER BY created_at DESC LIMIT %s",
@@ -94,27 +101,31 @@ def get_history(phone: str, limit: int = 8) -> list[dict]:
         log.error("get_history error: %s", e)
         return []
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def clear_history(phone: str) -> None:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute("DELETE FROM conversation_history WHERE phone = %s", (phone,))
         conn.commit()
         cur.close()
     except Exception as e:
         log.error("clear_history error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def get_inventory() -> str:
     conn = None
     try:
-        conn = get_conn() # עכשיו זה מוגן בפנים!
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute("SELECT name, price FROM products WHERE stock > 0 ORDER BY name")
         items = cur.fetchall()
@@ -127,10 +138,12 @@ def get_inventory() -> str:
         if conn:
             release_conn(conn)
 
+
 def get_pending_order(phone: str) -> dict | None:
     """מחזיר הזמנה פתוחה של הלקוח אם קיימת."""
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             """
@@ -157,13 +170,15 @@ def get_pending_order(phone: str) -> dict | None:
         log.error("get_pending_order error: %s", e)
         return None
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def update_order_address(order_id: int, new_address: str, phone: str) -> bool:
     """עדכון כתובת הזמנה — שומר את ה-WA_ID"""
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         final_address = f"{new_address} | WA_ID:{phone}"
         cur.execute(
@@ -176,16 +191,19 @@ def update_order_address(order_id: int, new_address: str, phone: str) -> bool:
         return affected > 0
     except Exception as e:
         log.error("update_order_address error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return False
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def update_order_items(order_id: int, new_items: str) -> bool:
     """עדכון מוצרים בהזמנה קיימת"""
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "UPDATE orders SET items = %s WHERE id = %s AND status = 'ממתין לאישור'",
@@ -197,15 +215,18 @@ def update_order_items(order_id: int, new_items: str) -> bool:
         return affected > 0
     except Exception as e:
         log.error("update_order_items error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return False
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def cancel_order_by_customer(order_id: int) -> bool:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "UPDATE orders SET status='בוטל', cancellation_reason='ביקוש לקוח' WHERE id=%s AND status='ממתין לאישור'",
@@ -217,15 +238,18 @@ def cancel_order_by_customer(order_id: int) -> bool:
         return affected > 0
     except Exception as e:
         log.error("cancel_order_by_customer error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return False
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def save_order(name: str, phone: str, address: str, items: str, order_type: str) -> int | None:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         final_address = f"{address} | WA_ID:{phone}"
         cur.execute(
@@ -238,15 +262,18 @@ def save_order(name: str, phone: str, address: str, items: str, order_type: str)
         return new_id
     except Exception as e:
         log.error("save_order error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return None
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def save_complaint(name: str, phone: str, description: str) -> bool:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO complaints (customer_name, phone, description) VALUES (%s,%s,%s)",
@@ -257,10 +284,12 @@ def save_complaint(name: str, phone: str, description: str) -> bool:
         return True
     except Exception as e:
         log.error("save_complaint error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return False
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 # ─────────────────────────────────────────────
