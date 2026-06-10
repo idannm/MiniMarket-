@@ -1,15 +1,12 @@
-הוספתי את כל 7 הפיצ'רים שביקשת בצורה חכמה ומסודרת, מבלי לשבור את הארכיטקטורה הקיימת.
+מעולה ששמת לב לכל הפרטים האלה! תיקנתי את כל הבעיות ברמת הארכיטקטורה כדי שהקוד יהיה חסין-כדורים לחלוטין (Bulletproof).
 
-הנה הפירוט של מה שהוספתי ואיך זה עובד:
-1. **חסימת מדיה**: הוספתי בדיקת `msg_type` ב-Webhook. אם זה תמונה/קול/וידאו/סטיקר, נשלחת הודעת הסירוב וההודעה מסומנת כמעובדת.
-2. **הזמנה מאושרת נעולה**: הוספתי את הפונקציה `get_approved_order` שמזהה הזמנות בסטטוסים מתקדמים ומזריקה ל-AI הנחיה חד-משמעית שאי אפשר לגעת בהן יותר.
-3. **מספר הבוס**: ה-AI מונחה להגיש את המספר 052-2025346 לכל מי שצריך נציג או מדווח על בעיה, אך להמשיך לשרת אותו כרגיל.
-4. **מעקב, שחזור ושמירת כתובת**: הוספתי את הפונקציה `get_last_order`. עכשיו ה-AI יודע מה סטטוס ההזמנה האחרונה ויודע להציע אותם מוצרים ואת אותה הכתובת.
-5. **מגבלת כמות**: הוכנס חוק ברזל 6 שאוסר על ה-AI להוסיף כמויות חריגות (כמו 15+ פריטים) בלי לשאול "בטוח?".
-6. **אישור ביטול כפול**: הוכנס חוק ברזל 7 ל-AI – חייבים לשאול "האם אתה בטוח?" ורק לאחר אישור לשלוח את פקודת הביטול אל ה-DB.
-7. **שתיקה ותפוגה**: נוסף רקע (Thread) שמתעורר כל 5 דקות. הוא מחפש ב-DB מספרי טלפון שהשיחה איתם (בהיסטוריה) עומדת על 1-24 שעות של שתיקה. אם לא שלחנו להם עדיין תזכורת – הוא שולח את התזכורת. אם עברו 24 שעות – הוא מוחק את ההיסטוריה.
+**מה תוקן ואיך:**
+1. **באג בביטול הזמנות (`cancel_order_by_customer`)**: מחקתי את `OR %s=0` ממסד הנתונים לחלוטין. הוספתי בדיקה בתוך הפייתון בשורה הראשונה של הפונקציה: `if order_id == 0: return True`. ככה הוא מדלג על הגישה ל-SQL, מסיים את הפונקציה בהצלחה, ומנקה את השיחה בלי למחוק הזמנות של אחרים. זה עכשיו 100% בטוח.
+2. **ניהול Connection Pool בכל הקוד**: שיניתי את כל הפונקציות לתבנית מחמירה ואמינה. קודם כל מגדירים `conn = None`, פותחים `try`, לוקחים `get_conn`, ובסוף יש `finally` שבודק `if conn: release_conn(conn)`. אם משהו קורס (כולל אם אין חיבור זמין מהמאגר), השרת לא ייתקע ועדיין ישחרר מה שצריך.
+3. **דליפה בתהליך הרקע (`background_tasks_loop`)**: הזזתי את `conn = None` ואת `try/finally` לתוך הבלוק הפנימי של ה-`while True`. כעת, בכל סבב של 5 דקות הוא לוקח Connection טרי ומשחרר אותו ב-`finally`. גם אם המאגר נופל זמנית, הלולאה תתפוס את השגיאה, תשחרר את החיבור ותנסה שוב בעוד 5 דקות. אין יותר דליפות.
+4. **תזכורת שתיקה חכמה**: כדי למנוע את הבעיה שהתזכורת תישלח שוב, במקום לבדוק מי "ההודעה האחרונה", הלולאה בודקת האם **קיימת** הודעת תזכורת בהיסטוריית השיחה הנוכחית של הלקוח. מאחר וההיסטוריה נמחקת לגמרי בסוף כל הזמנה או אחרי 24 שעות, זה מבטיח שהלקוח יקבל את התזכורת **בדיוק פעם אחת** לכל ניסיון הזמנה, ולא משנה מה קרה בשיחה בינתיים.
 
-הנה הקוד המלא והמעודכן שאתה יכול להעתיק ישירות לשרת שלך:
+הנה הקוד המעודכן והסופי שמוכן להעלאה:
 
 ```python
 import os
@@ -49,8 +46,8 @@ def release_conn(conn):
     db_pool.putconn(conn)
 
 # --- Debounce state ---
-pending_messages: dict[str, list[str]] = {}
-pending_timers:   dict[str, threading.Timer] = {}
+pending_messages = {}
+pending_timers = {}
 debounce_lock = threading.Lock()
 
 # ─────────────────────────────────────────────
@@ -58,8 +55,9 @@ debounce_lock = threading.Lock()
 # ─────────────────────────────────────────────
 
 def is_message_processed(message_id: str) -> bool:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO processed_messages (message_id) VALUES (%s) ON CONFLICT (message_id) DO NOTHING RETURNING id",
@@ -71,15 +69,18 @@ def is_message_processed(message_id: str) -> bool:
         return inserted is None
     except Exception as e:
         log.error("is_message_processed error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return True
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def save_message(phone: str, role: str, content: str) -> None:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO conversation_history (phone, role, content) VALUES (%s, %s, %s)",
@@ -89,14 +90,17 @@ def save_message(phone: str, role: str, content: str) -> None:
         cur.close()
     except Exception as e:
         log.error("save_message error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
-def get_history(phone: str, limit: int = 8) -> list[dict]:
-    conn = get_conn()
+def get_history(phone: str, limit: int = 8):
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "SELECT role, content FROM conversation_history WHERE phone = %s ORDER BY created_at DESC LIMIT %s",
@@ -109,26 +113,31 @@ def get_history(phone: str, limit: int = 8) -> list[dict]:
         log.error("get_history error: %s", e)
         return []
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def clear_history(phone: str) -> None:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute("DELETE FROM conversation_history WHERE phone = %s", (phone,))
         conn.commit()
         cur.close()
     except Exception as e:
         log.error("clear_history error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def get_inventory() -> str:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute("SELECT name, price FROM products WHERE stock > 0 ORDER BY name")
         items = cur.fetchall()
@@ -138,12 +147,14 @@ def get_inventory() -> str:
         log.error("get_inventory error: %s", e)
         return "שגיאה בטעינת המלאי"
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
-def get_pending_order(phone: str) -> dict | None:
-    conn = get_conn()
+def get_pending_order(phone: str):
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             """
@@ -170,12 +181,14 @@ def get_pending_order(phone: str) -> dict | None:
         log.error("get_pending_order error: %s", e)
         return None
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
-def get_approved_order(phone: str) -> dict | None:
-    conn = get_conn()
+def get_approved_order(phone: str):
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             """
@@ -196,12 +209,14 @@ def get_approved_order(phone: str) -> dict | None:
         log.error("get_approved_order error: %s", e)
         return None
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
-def get_last_order(phone: str) -> dict | None:
-    conn = get_conn()
+def get_last_order(phone: str):
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             """
@@ -227,12 +242,14 @@ def get_last_order(phone: str) -> dict | None:
         log.error("get_last_order error: %s", e)
         return None
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def update_order_address(order_id: int, new_address: str, phone: str) -> bool:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         final_address = f"{new_address} | WA_ID:{phone}"
         cur.execute(
@@ -245,15 +262,18 @@ def update_order_address(order_id: int, new_address: str, phone: str) -> bool:
         return affected > 0
     except Exception as e:
         log.error("update_order_address error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return False
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def update_order_items(order_id: int, new_items: str) -> bool:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "UPDATE orders SET items = %s WHERE id = %s AND status = 'ממתין לאישור'",
@@ -265,19 +285,26 @@ def update_order_items(order_id: int, new_items: str) -> bool:
         return affected > 0
     except Exception as e:
         log.error("update_order_items error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return False
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def cancel_order_by_customer(order_id: int) -> bool:
-    conn = get_conn()
+    # טיפול בטוח בפקודת CANCEL_ORDER|0 מצד הפייתון
+    if order_id == 0:
+        return True
+        
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
-            "UPDATE orders SET status='בוטל', cancellation_reason='ביקוש לקוח' WHERE (id=%s OR %s=0) AND status='ממתין לאישור'",
-            (order_id, order_id)
+            "UPDATE orders SET status='בוטל', cancellation_reason='ביקוש לקוח' WHERE id=%s AND status='ממתין לאישור'",
+            (order_id,)
         )
         affected = cur.rowcount
         conn.commit()
@@ -285,15 +312,18 @@ def cancel_order_by_customer(order_id: int) -> bool:
         return affected > 0
     except Exception as e:
         log.error("cancel_order_by_customer error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return False
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
-def save_order(name: str, phone: str, address: str, items: str, order_type: str) -> int | None:
-    conn = get_conn()
+def save_order(name: str, phone: str, address: str, items: str, order_type: str):
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         final_address = f"{address} | WA_ID:{phone}"
         cur.execute(
@@ -306,15 +336,18 @@ def save_order(name: str, phone: str, address: str, items: str, order_type: str)
         return new_id
     except Exception as e:
         log.error("save_order error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return None
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 def save_complaint(name: str, phone: str, description: str) -> bool:
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO complaints (customer_name, phone, description) VALUES (%s,%s,%s)",
@@ -325,10 +358,12 @@ def save_complaint(name: str, phone: str, description: str) -> bool:
         return True
     except Exception as e:
         log.error("save_complaint error: %s", e)
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return False
     finally:
-        release_conn(conn)
+        if conn:
+            release_conn(conn)
 
 
 # ─────────────────────────────────────────────
@@ -338,6 +373,7 @@ def save_complaint(name: str, phone: str, description: str) -> bool:
 def background_tasks_loop():
     REMINDER_TEXT = "היי, ראיתי שהפסקת באמצע. יש משהו שאפשר לעזור בו? (כתוב לי 'לא' אם תרצה שאפסיק להציק 😅)"
     while True:
+        conn = None
         try:
             conn = get_conn()
             cur = conn.cursor()
@@ -353,10 +389,10 @@ def background_tasks_loop():
             remind_phones = cur.fetchall()
             for row in remind_phones:
                 p = row[0]
-                # check if last message is already the reminder to prevent spamming
-                cur.execute("SELECT content FROM conversation_history WHERE phone = %s ORDER BY created_at DESC LIMIT 1", (p,))
-                last_msg = cur.fetchone()
-                if last_msg and last_msg[0] != REMINDER_TEXT:
+                # בדיקה האם כבר שלחנו תזכורת בסשן הנוכחי, במקום לבדוק רק את ההודעה האחרונה.
+                cur.execute("SELECT 1 FROM conversation_history WHERE phone = %s AND content = %s LIMIT 1", (p, REMINDER_TEXT))
+                already_sent = cur.fetchone()
+                if not already_sent:
                     send_whatsapp(p, REMINDER_TEXT)
 
             # Clear history if > 24 hours of silence
@@ -369,13 +405,16 @@ def background_tasks_loop():
             clear_phones = cur.fetchall()
             for row in clear_phones:
                 p = row[0]
-                clear_history(p)
+                cur.execute("DELETE FROM conversation_history WHERE phone = %s", (p,))
+                conn.commit()
                 log.info("Cleared history for %s after 24 hours of silence.", p)
                 
             cur.close()
-            release_conn(conn)
         except Exception as e:
             log.error("background_tasks_loop error: %s", e)
+        finally:
+            if conn:
+                release_conn(conn)
             
         time.sleep(300) # Check every 5 minutes
 
@@ -458,41 +497,51 @@ def process_messages(phone: str) -> None:
     context_lines = []
 
     if approved_order:
-        context_lines.append(f"🔒 שימו לב: ללקוח יש הזמנה פעילה בסטטוס '{approved_order['status']}'. לא ניתן לשנות או לבטל אותה. אם הלקוח מתעקש לשנות, הסבר לו באדיבות שהיא כבר ננעלה לטיפול, ושהוא יכול ליצור קשר עם הבוס או לעשות הזמנה חדשה נוספת.")
+        status_str = approved_order['status']
+        context_lines.append(f"🔒 שימו לב: ללקוח יש הזמנה פעילה בסטטוס '{status_str}'. לא ניתן לשנות או לבטל אותה. אם הלקוח מתעקש לשנות, הסבר לו באדיבות שהיא כבר ננעלה לטיפול, ושהוא יכול ליצור קשר עם הבוס או לעשות הזמנה חדשה נוספת.")
 
     if pending_order:
         address_clean = pending_order['address'].split('|')[0].strip()
-        context_lines.append(f'''
+        p_id = pending_order['id']
+        p_name = pending_order['customer_name']
+        p_items = pending_order['items']
+        p_type = pending_order['order_type']
+        
+        context_lines.append(f"""
 ℹ️ ללקוח יש הזמנה פתוחה שממתינה לאישור הבעל הבית:
-  מספר הזמנה: #{pending_order['id']}
-  שם: {pending_order['customer_name']}
-  מוצרים כרגע: {pending_order['items']}
+  מספר הזמנה: #{p_id}
+  שם: {p_name}
+  מוצרים כרגע: {p_items}
   כתובת: {address_clean}
-  סוג: {pending_order['order_type']}
+  סוג: {p_type}
 
 מה הלקוח יכול לעשות עם ההזמנה הפתוחה:
-✅ להוסיף מוצרים — עדכן את כל הרשימה (ישנים+חדשים): UPDATE_ITEMS|{pending_order['id']}|[רשימה מלאה]
-✅ לשנות כתובת — רשום: UPDATE_ADDRESS|{pending_order['id']}|[כתובת מלאה]
-✅ לבטל את ההזמנה — רק לאחר אישור כפול של הלקוח, רשום: CANCEL_ORDER|{pending_order['id']}
+✅ להוסיף מוצרים — עדכן את כל הרשימה (ישנים+חדשים): UPDATE_ITEMS|{p_id}|[רשימה מלאה]
+✅ לשנות כתובת — רשום: UPDATE_ADDRESS|{p_id}|[כתובת מלאה]
+✅ לבטל את ההזמנה — רק לאחר אישור כפול של הלקוח, רשום: CANCEL_ORDER|{p_id}
 ✅ לעשות הזמנה חדשה בנוסף.
-''')
+""")
     else:
         context_lines.append("אין הזמנות פתוחות ללקוח זה — ניתן לקבל הזמנה חדשה.")
 
     if last_order:
         last_address_clean = last_order['address'].split('|')[0].strip()
-        context_lines.append(f'''
+        l_id = last_order['id']
+        l_items = last_order['items']
+        l_status = last_order['status']
+        
+        context_lines.append(f"""
 📜 מידע מהזמנה אחרונה של הלקוח:
-  מספר הזמנה אחרונה: #{last_order['id']}
-  מוצרים: {last_order['items']}
+  מספר הזמנה אחרונה: #{l_id}
+  מוצרים: {l_items}
   כתובת אחרונה: {last_address_clean}
-  סטטוס: {last_order['status']}
+  סטטוס: {l_status}
 
 השתמש בזה כדי:
 - לענות על בקשת מעקב (לספק את הסטטוס).
 - להציע 'הזמנה חוזרת' (להציע את אותם המוצרים לחיסכון בזמן).
 - לשאול אם לשלוח לכתובת האחרונה השמורה כדי לחסוך ללקוח הקלדה.
-''')
+""")
 
     pending_ctx = "\n".join(context_lines)
 
@@ -583,10 +632,13 @@ def process_messages(phone: str) -> None:
                     success  = cancel_order_by_customer(order_id)
                     if clean_msg:
                         send_whatsapp(phone, clean_msg)
-                    if success and order_id != 0:
-                        send_whatsapp(phone, f"✅ ההזמנה #{order_id} בוטלה. אם תרצה להזמין שוב — אני כאן! 😊")
-                    elif order_id != 0:
-                        send_whatsapp(phone, "לא הצלחתי לבטל — יכול להיות שההזמנה כבר אושרה או שלא נמצאה. לבירורים ניתן לפנות לבוס ב-052-2025346.")
+                        
+                    if order_id != 0:
+                        if success:
+                            send_whatsapp(phone, f"✅ ההזמנה #{order_id} בוטלה. אם תרצה להזמין שוב — אני כאן! 😊")
+                        else:
+                            send_whatsapp(phone, "לא הצלחתי לבטל — יכול להיות שההזמנה כבר אושרה או שלא נמצאה. לבירורים ניתן לפנות לבוס ב-052-2025346.")
+                            
                     clear_history(phone)
                 except (ValueError, IndexError) as e:
                     log.error("CANCEL_ORDER parse error: %s", e)
@@ -721,7 +773,7 @@ def home():
     return jsonify({
         "status":  "running",
         "service": "WhatsApp Bot — המכולת של הצדיק",
-        "version": "6.0"
+        "version": "6.2"
     })
 
 
