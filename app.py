@@ -5,7 +5,7 @@ import requests
 import psycopg2
 from psycopg2 import pool
 from flask import Flask, request, jsonify
-# החלפת הייבוא של גרוק בייבוא של גוגל
+# ייבוא הספריות הרשמיות של גוגל ג'ימני
 from google import genai
 from google.genai import types
 
@@ -17,7 +17,6 @@ app = Flask(__name__)
 
 # --- הגדרות ---
 DB_URL          = os.environ.get("DB_URL")
-# משתנה סביבה חדש עבור גוגל
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY")
 WHATSAPP_TOKEN  = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
@@ -395,9 +394,9 @@ CANCEL_ORDER|{pending_order['id']}
                 types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])])
             )
 
-        # קריאה ל-Gemini API (משתמש במודל gemini-1.5-flash המהיר והחינמי)
+        # תיקון: קריאה ל-Gemini API עם הנתיב המלא של המודל (models/gemini-1.5-flash)
         response = gemini_client.models.generate_content(
-            model='gemini-1.5-flash',
+            model='models/gemini-1.5-flash',
             contents=gemini_contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
@@ -585,7 +584,7 @@ def home():
     return jsonify({
         "status":  "running",
         "service": "WhatsApp Bot — המכולת של הצדיק (Gemini Edition)",
-        "version": "6.0"
+        "version": "6.1"
     })
 
 
