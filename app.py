@@ -394,9 +394,9 @@ CANCEL_ORDER|{pending_order['id']}
                 types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])])
             )
 
-        # תיקון: קריאה ל-Gemini API עם הנתיב המלא של המודל (models/gemini-1.5-flash)
+        # תיקון ומעבר למודל היציב והחדש ביותר gemini-2.5-flash
         response = gemini_client.models.generate_content(
-            model='models/gemini-1.5-flash',
+            model='gemini-2.5-flash',
             contents=gemini_contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
@@ -584,7 +584,7 @@ def home():
     return jsonify({
         "status":  "running",
         "service": "WhatsApp Bot — המכולת של הצדיק (Gemini Edition)",
-        "version": "6.1"
+        "version": "6.2"
     })
 
 
