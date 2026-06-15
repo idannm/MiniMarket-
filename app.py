@@ -21,7 +21,7 @@ WHATSAPP_TOKEN  = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN    = os.environ.get("VERIFY_TOKEN", "my_secret_password")
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "123")
-DEBOUNCE_SECS   = 2.5
+DEBOUNCE_SECS   = 6.0 # הוגדל ל-6 שניות כדי לקבץ הודעות מהירות לתשובה אחת
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
@@ -283,7 +283,6 @@ def update_order_items(order_id: int, new_items: str) -> bool:
 
 
 def cancel_order_by_customer(order_id: int) -> bool:
-    # טיפול בטוח בפקודת CANCEL_ORDER|0 מצד הפייתון
     if order_id == 0:
         return True
         
@@ -367,7 +366,6 @@ def background_tasks_loop():
             conn = get_conn()
             cur = conn.cursor()
             
-            # Send reminder if > 1 hour and < 24 hours of silence
             cur.execute('''
                 SELECT phone, MAX(created_at)
                 FROM conversation_history
@@ -378,13 +376,11 @@ def background_tasks_loop():
             remind_phones = cur.fetchall()
             for row in remind_phones:
                 p = row[0]
-                # בדיקה האם כבר שלחנו תזכורת בסשן הנוכחי, במקום לבדוק רק את ההודעה האחרונה.
                 cur.execute("SELECT 1 FROM conversation_history WHERE phone = %s AND content = %s LIMIT 1", (p, REMINDER_TEXT))
                 already_sent = cur.fetchone()
                 if not already_sent:
                     send_whatsapp(p, REMINDER_TEXT)
 
-            # Clear history if > 24 hours of silence
             cur.execute('''
                 SELECT phone
                 FROM conversation_history
@@ -405,7 +401,7 @@ def background_tasks_loop():
             if conn:
                 release_conn(conn)
             
-        time.sleep(300) # Check every 5 minutes
+        time.sleep(300)
 
 # Start the background thread
 bg_thread = threading.Thread(target=background_tasks_loop, daemon=True)
@@ -541,12 +537,13 @@ def process_messages(phone: str) -> None:
 
 חוקים:
 1. ענה בעברית פשוטה וטבעית.
-2. ענה על הכל בתשובה אחת בלבד.
+2. ענה על הכל בתשובה אחת בלבד בצורה זורמת ומחוברת. אם הלקוח שלח כמה הודעות או שאל כמה שאלות במקביל - ענה על הכל יחד באותה הודעה, אל תענה "אחד אחד".
 3. אל תחזור על עצמך.
 4. לעולם אל תגיד ללקוח שהוא "לא יכול" לעשות הזמנה חדשה — הוא תמיד יכול!
 5. 📞 טלפון של הבוס: אם הלקוח מבקש נציג אנושי, מנהל או מתלונן על בעיה, מסור לו באדיבות את המספר של הבוס (052-2025346), והמשך לשרת אותו כרגיל (אין להשתיק את עצמך).
 6. ⚠️ מגבלת כמות הגיונית: אם לקוח מבקש כמות חריגה (כמו 50 בקבוקי שמן או מעל 15 יחידות של מוצר בודד), חובה עליך לעצור ולשאול: "בטוח? זה נשמע כמות גדולה" לפני שאתה סוגר את ההזמנה.
 7. 🚫 אישור ביטול כפול: לעולם אל תבטל הזמנה מיידית! אם הלקוח רוצה לבטל, שאל אותו קודם "בטוח שתרצה לבטל את הזמנה X?". רק לאחר שהוא משיב בחיוב ("כן", "מאשר") תוכל לשלוח את הפקודה CANCEL_ORDER|[ID]. (אם הוא עונה "לא" לתזכורת השתיקה או מבקש שתפסיק להציק, תוכל לשלוח פשוט CANCEL_ORDER|0 כדי לסיים את השיחה ולנקות אותה).
+8. ⏰ שעות פתיחה: החנות פתוחה פיזית בין השעות 08:00 ל-20:00 (שמונה בבוקר עד שמונה בערב). אבל הבוט (אתה) מקבל הזמנות 24/7 מתי שרק רוצים! אם הלקוח שואל, ציין זאת בפניו.
 
 🚨 תלונות (מגעיל / רקוב / קרוע / זבל):
 - התנצל, אל תציע קניות
@@ -563,7 +560,6 @@ def process_messages(phone: str) -> None:
         return
 
     try:
-        # המרת ההיסטוריה לפורמט שג'מיני מצפה לו
         gemini_history = []
         for msg in history:
             role = "model" if msg["role"] == "assistant" else "user"
@@ -575,7 +571,7 @@ def process_messages(phone: str) -> None:
             config={
                 "system_instruction": system_prompt,
                 "temperature": 0.2,
-                "max_output_tokens": 300,
+                "max_output_tokens": 1000, # הוגדל מ-300 ל-1000 כדי שההודעות לא יחתכו לעולם
             }
         )
         
@@ -776,7 +772,7 @@ def home():
     return jsonify({
         "status":  "running",
         "service": "WhatsApp Bot — המכולת של הצדיק",
-        "version": "6.3"
+        "version": "6.4"
     })
 
 
