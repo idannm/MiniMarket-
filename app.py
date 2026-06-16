@@ -114,6 +114,7 @@ def clear_history(phone: str) -> None:
         cur.execute("DELETE FROM conversation_history WHERE phone = %s", (phone,))
         conn.commit()
         cur.close()
+        log.info("Successfully cleared history in DB for %s", phone)
     except Exception as e:
         log.error("clear_history error: %s", e)
         if conn:
@@ -445,7 +446,7 @@ def send_whatsapp(phone: str, text: str) -> bool:
 
 
 # ─────────────────────────────────────────────
-# Debounce
+# Debounce & Process
 # ─────────────────────────────────────────────
 
 def enqueue_message(phone: str, text: str) -> None:
@@ -500,11 +501,10 @@ def process_messages(phone: str) -> None:
   כתובת: {address_clean}
   סוג: {p_type}
 
-מה הלקוח יכול לעשות עם ההזמנה הפתוחה:
-✅ להוסיף מוצרים — עדכן את כל הרשימה (ישנים+חדשים): UPDATE_ITEMS|{p_id}|[רשימה מלאה]
-✅ לשנות כתובת — רשום: UPDATE_ADDRESS|{p_id}|[כתובת מלאה]
-✅ לבטל את ההזמנה — נסה לשכנע אותו קודם, ואם מתעקש שלח: CANCEL_ORDER|{p_id}
-✅ לעשות הזמנה חדשה בנוסף.
+מה הלקוח יכול לעשות עם ההזמנה הפתוחה (פקודות מערכת):
+- להוסיף/לשנות מוצרים: הבוט חייב להחזיר טקסט חופשי ובסוף להצמיד: UPDATE_ITEMS|{p_id}|[רשימה מעודכנת מלאה]
+- לשנות כתובת: הבוט יחזיר תשובה חיובית ובסוף יצמיד: UPDATE_ADDRESS|{p_id}|[כתובת חדשה]
+- לבטל את ההזמנה: אם הוא מבקש פעם ראשונה, נסה לשכנע אותו באדיבות. אם הוא מתעקש ואומר "סגור", "בטוח", "תבטל לי" בפעם השנייה - החזר בסוף התשובה: CANCEL_ORDER|{p_id}
 """)
     else:
         context_lines.append("אין הזמנות פתוחות ללקוח זה — ניתן לקבל הזמנה חדשה.")
@@ -522,45 +522,43 @@ def process_messages(phone: str) -> None:
   כתובת אחרונה: {last_address_clean}
   סטטוס: {l_status}
 
-השתמש בזה כדי:
-- לענות על בקשת מעקב (לספק את הסטטוס).
-- להציע 'הזמנה חוזרת' (להציע את אותם המוצרים לחיסכון בזמן).
-- לשאול אם לשלוח לכתובת האחרונה השמורה כדי לחסוך ללקוח הקלדה.
+השתמש בזה כדי להציע 'הזמנה חוזרת' או לשאול אם לשלוח לאותה כתובת.
 """)
 
     pending_ctx = "\n".join(context_lines)
 
     system_prompt = f"""אתה "חיים", המוכר האדיב במכולת "המכולת של הצדיק".
-המלאי: {inventory}
+המלאי הזמין כרגע בחנות למכירה: {inventory}
 
 {pending_ctx}
 
-חוקים:
-1. ענה בעברית פשוטה וטבעית.
-2. ענה על הכל בתשובה אחת בלבד בצורה זורמת ומחוברת. אם הלקוח שלח כמה הודעות במקביל - ענה על הכל יחד באותה הודעה.
-3. אל תחזור על עצמך.
-4. תמיד ניתן להזמין מחדש.
-5. 📞 טלפון של הבוס: לכל בירור אנושי, תן את המספר 052-2025346 אך המשך לשרת כרגיל.
-6. ⚠️ מגבלת כמות הגיונית: אם לקוח מבקש מעל 15 יחידות של אותו מוצר, שאל ליתר ביטחון "בטוח? זו כמות גדולה".
-7. 🚫 ביטול הזמנה (שכנוע קל): אם הלקוח מבקש לבטל הזמנה קיימת, נסה קודם כל לשכנע אותו להישאר (למשל: "בטוח? חבל יש דברים ממש טובים היום"). רק אם הוא עדיין מתעקש בפעם השנייה ומאשר, שלח CANCEL_ORDER|[ID]. ההזמנה תתבטל ותופיע אוטומטית בדשבורד עם הסטטוס 'בוטל' והבוס יראה זאת. (אם זו רק שיחת התייעצות ללא הזמנה ואומר "עזוב לא משנה", שלח CANCEL_ORDER|0 לניקוי השיחה).
-8. ⏰ שעות פתיחה: החנות פתוחה פיזית מ-08:00 עד 20:00. הבוט פעיל 24/7 מתי שרק רוצים.
+חוקים מוחלטים להתנהגות הבוט:
+1. ענה תמיד בעברית פשוטה, חמה, זורמת ואנושית (כמו מוכר במכולת).
+2. אם הלקוח שלח כמה הודעות במקביל, התייחס לכולן יחד בתשובה אחת מרוכזת ויפה.
+3. 📞 טלפון של הבוס לבירורים מיוחדים: 052-2025346.
+4. ⚠️ כמויות גדולות: אם לקוח מבקש מעל 15 יחידות ממוצר מסוים, שאל קודם "בטוח? זו כמות גדולה".
+5. ⏰ שעות פעילות: החנות פתוחה פיזית מ-08:00 עד 20:00. הבוט עונה ומקבל הזמנות 24/7.
 
-🚨 תלונות ובעיות (מגעיל / חסר / הרוס):
-- נסח בעצמך תקציר ענייני ומדויק ב-2 משפטים של סיבת התלונה במקום סתם להעתיק את הודעת הלקוח, כדי שהבוס יקבל פירוט ברור ויבין בדיוק מה קרה.
-- רשום: FINAL_COMPLAINT|{phone}|[שם]|[הסיבה המדויקת שניסחת עבור הבוס]
+🚫 חוק ביטול הזמנה קיימת (שכנוע קל):
+- אם הלקוח מבקש לבטל את ההזמנה הפתוחה שלו בפעם הראשונה (או משתמש במילים כמו "תבטל", "עזוב לא צריך", "סגור את זה (במובן של לבטל)"), אל תבטל מיד! נסה לשכנע אותו להישאר (למשל: "בטוח נשמה? חבל, יש לנו היום דברים טריים ומצוינים").
+- רק אם הוא מתעקש פעם שנייה ואומר "כן תבטל", "בטוח", או "תסגור לי את זה" בהקשר של ביטול - שלח בסוף ההודעה שלך את המבנה: CANCEL_ORDER|[ID]. (אם אין לו בכלל הזמנה והוא סתם אומר "עזוב לא משנה", רשום CANCEL_ORDER|0).
 
-🛒 קניות:
-שלב 1 — בחירת מוצרים → "תרצה להוסיף עוד משהו?" (ניתן להציע מהזמנה קודמת).
-שלב 2 — משלוח או איסוף?
-שלב 3 — איסוף פרטים. משלוח דורש שם+כתובת מדוייקת. איסוף דורש שם בלבד.
-שלב 4 — כשהכל ברור → FINAL_ORDER|{phone}|[שם]|[כתובת/איסוף]|[מוצרים]|[סוג]"""
+🚨 תלונות ובעיות (מוצר מקולקל / חסר / משלוח שהתרסק):
+- אל תעתיק את המילים של הלקוח! נסח בעצמך תקציר חכם, מקצועי וענייני ב-2 משפטים שמסביר לבוס מה הבעיה (למשל: "הלקוח קיבל חלב פג תוקף והקוטג' היה פתוח").
+- רשום בסוף ההודעה: FINAL_COMPLAINT|{phone}|[שם הלקוח]|[הניסוח המדויק והמתומצת שכתבת עבור הבוס]
+
+🛒 תהליך רכישה חדשה:
+שלב 1 — בחירת מוצרים מהמלאי בלבד.
+שלב 2 — שאל: "משלוח או איסוף עצמי?"
+שלב 3 — איסוף פרטים: משלוח מחייב שם מלא + כתובת מדויקת. איסוף עצמי דורש שם בלבד.
+שלב 4 — כשהכל מוכן ומאושר לחלוטין על ידי הלקוח, שלח בסוף ההודעה: FINAL_ORDER|{phone}|[שם]|[כתובת או איסוף עצמי]|[רשימת מוצרים סופית]|[סוג: משלוח/איסוף]"""
 
     if not gemini_client:
         send_whatsapp(phone, f"שלום! המלאי שלנו:\n{inventory}")
         return
 
     try:
-        # מיזוג הודעות מאותו שולח כדי למנוע קריסה מ-Gemini שדורש תורות מתחלפים
+        # מיזוג הודעות רצופות למניעת קריסות של חילופי תורות ב-Gemini
         gemini_history = []
         for msg in history:
             role = "model" if msg["role"] == "assistant" else "user"
@@ -582,110 +580,112 @@ def process_messages(phone: str) -> None:
         
         if not completion.text:
             log.warning("Empty response from Gemini")
-            send_whatsapp(phone, "סליחה, לא הצלחתי לייצר תשובה כרגע. נסה שוב? 🙏")
+            send_whatsapp(phone, "סליחה, לא הצלחתי להבין. תוכל לכתוב שוב בשבילי? 🙏")
             return
             
         bot_reply = completion.text.strip()
-        log.info("AI reply for %s: %s", phone, bot_reply[:100])
+        log.info("AI raw reply for %s: %s", phone, bot_reply[:120])
 
-        # ── UPDATE_ITEMS ──
+        # ── ניתוח חכם של פקודות מערכת למניעת קריסות (Safe Parsing) ──
+        
+        # 1. עדכון מוצרים
         if "UPDATE_ITEMS|" in bot_reply:
-            parts     = bot_reply.split("|")
             clean_msg = bot_reply.split("UPDATE_ITEMS|")[0].strip()
-            if len(parts) >= 3:
-                try:
-                    order_id   = int(parts[1].strip())
-                    new_items  = parts[2].strip()
-                    success = update_order_items(order_id, new_items)
-                    if success:
-                        if clean_msg:
-                            send_whatsapp(phone, clean_msg)
-                        send_whatsapp(phone, f"✅ עדכנתי את ההזמנה #{order_id}!\n🛍️ מוצרים: {new_items}\n\nממתינים לאישור הבוס 😊")
-                    else:
-                        send_whatsapp(phone, "אופס, לא הצלחתי לעדכן. נסה שוב? 🙏")
-                except (ValueError, IndexError) as e:
-                    log.error("UPDATE_ITEMS parse error: %s", e)
-                    send_whatsapp(phone, "לא הצלחתי לעדכן. תנסח שוב? 🙏")
+            parts = bot_reply.split("UPDATE_ITEMS|")[1].split("|")
+            try:
+                order_id = int(parts[0].strip())
+                new_items = parts[1].strip() if len(parts) > 1 else "מוצרים מעודכנים"
+                update_order_items(order_id, new_items)
+                if clean_msg: send_whatsapp(phone, clean_msg)
+                send_whatsapp(phone, f"✅ ההזמנה שלך עודכנה בהצלחה (הזמנה #{order_id})!\n🛍️ המוצרים המעודכנים: {new_items}")
+            except Exception as e:
+                log.error("Fail to parse UPDATE_ITEMS: %s", e)
+                send_whatsapp(phone, clean_msg if clean_msg else "עדכנתי את המוצרים לבקשתך!")
 
-        # ── UPDATE_ADDRESS ──
+        # 2. עדכון כתובת
         elif "UPDATE_ADDRESS|" in bot_reply:
-            parts     = bot_reply.split("|")
             clean_msg = bot_reply.split("UPDATE_ADDRESS|")[0].strip()
-            if len(parts) >= 3:
-                try:
-                    order_id    = int(parts[1].strip())
-                    new_address = parts[2].strip()
-                    success = update_order_address(order_id, new_address, phone)
-                    if success:
-                        if clean_msg:
-                            send_whatsapp(phone, clean_msg)
-                        send_whatsapp(phone, f"✅ עדכנתי את הכתובת להזמנה #{order_id}:\n📍 {new_address}\n\nממתינים לאישור הבוס!")
-                    else:
-                        send_whatsapp(phone, "אופס, לא הצלחתי לעדכן. נסה שוב? 🙏")
-                except (ValueError, IndexError) as e:
-                    log.error("UPDATE_ADDRESS parse error: %s", e)
-                    send_whatsapp(phone, "לא הצלחתי לעדכן את הכתובת. תנסח שוב? 🙏")
+            parts = bot_reply.split("UPDATE_ADDRESS|")[1].split("|")
+            try:
+                order_id = int(parts[0].strip())
+                new_address = parts[1].strip() if len(parts) > 1 else "כתובת חדשה"
+                update_order_address(order_id, new_address, phone)
+                if clean_msg: send_whatsapp(phone, clean_msg)
+                send_whatsapp(phone, f"✅ עדכנתי את הכתובת החדשה למשלוח עבור הזמנה #{order_id}!\n📍 הכתובת: {new_address}")
+            except Exception as e:
+                log.error("Fail to parse UPDATE_ADDRESS: %s", e)
+                send_whatsapp(phone, clean_msg if clean_msg else "הכתובת עודכנה במערכת!")
 
-        # ── CANCEL_ORDER ──
+        # 3. ביטול הזמנה קיימת
         elif "CANCEL_ORDER|" in bot_reply:
-            parts     = bot_reply.split("|")
             clean_msg = bot_reply.split("CANCEL_ORDER|")[0].strip()
-            if len(parts) >= 2:
-                try:
-                    order_id = int(parts[1].strip())
-                    success  = cancel_order_by_customer(order_id)
-                    if clean_msg:
-                        send_whatsapp(phone, clean_msg)
-                        
-                    if order_id != 0:
-                        if success:
-                            send_whatsapp(phone, f"✅ ההזמנה #{order_id} בוטלה. אם תרצה להזמין שוב — אני כאן! 😊")
-                        else:
-                            send_whatsapp(phone, "לא הצלחתי לבטל — יכול להיות שההזמנה כבר אושרה או שלא נמצאה. לבירורים ניתן לפנות לבוס ב-052-2025346.")
-                            
-                    clear_history(phone)
-                except (ValueError, IndexError) as e:
-                    log.error("CANCEL_ORDER parse error: %s", e)
-
-        # ── FINAL_COMPLAINT ──
-        elif "FINAL_COMPLAINT|" in bot_reply:
-            parts     = bot_reply.split("|")
-            clean_msg = bot_reply.split("FINAL_COMPLAINT|")[0].strip()
-            if clean_msg:
-                send_whatsapp(phone, clean_msg)
-            if len(parts) >= 4:
-                save_complaint(parts[2], parts[1], parts[3])
-                send_whatsapp(phone, "העברתי את התלונה ישירות לבוס לבדיקה דחופה! 🤕 (לבירורים נוספים: 052-2025346)")
+            parts = bot_reply.split("CANCEL_ORDER|")[1].split("|")
+            try:
+                order_id = int(parts[0].strip())
+                if order_id != 0:
+                    success = cancel_order_by_customer(order_id)
+                    if clean_msg: send_whatsapp(phone, clean_msg)
+                    if success:
+                        send_whatsapp(phone, f"🛑 לבקשתך, הזמנה #{order_id} בוטלה במערכת ומופיעה כ'בוטלה' בדשבורד של המנהל. נשמח לשרת אותך בפעם הבאה! 🙏")
+                    else:
+                        send_whatsapp(phone, "לא הצלחתי לבטל אוטומטית — יכול להיות שהיא כבר אושרה או ננעלה. לבירור מהיר דבר עם הבוס: 052-2025346.")
+                else:
+                    if clean_msg: send_whatsapp(phone, clean_msg)
+                
+                # מחיקת היסטוריה בבטחה לאחר שליחת ההודעות
                 clear_history(phone)
+            except Exception as e:
+                log.error("Fail to parse CANCEL_ORDER: %s", e)
+                if clean_msg: send_whatsapp(phone, clean_msg)
 
-        # ── FINAL_ORDER ──
+        # 4. רישום תלונה חכם
+        elif "FINAL_COMPLAINT|" in bot_reply:
+            clean_msg = bot_reply.split("FINAL_COMPLAINT|")[0].strip()
+            parts = bot_reply.split("FINAL_COMPLAINT|")[1].split("|")
+            try:
+                c_phone = parts[0].strip() if len(parts) > 0 else phone
+                c_name = parts[1].strip() if len(parts) > 1 else "לקוח ללא שם"
+                c_desc = parts[2].strip() if len(parts) > 2 else "תלונה כללית"
+                
+                save_complaint(c_name, c_phone, c_desc)
+                if clean_msg: send_whatsapp(phone, clean_msg)
+                send_whatsapp(phone, "⚠️ תלונתך נוסחה בצורה מסודרת והועברה ישירות לטיפול אישי ודחוף של הבוס בדשבורד המנהל! (לבירור נוסף: 052-2025346)")
+                
+                clear_history(phone)
+            except Exception as e:
+                log.error("Fail to parse FINAL_COMPLAINT: %s", e)
+                if clean_msg: send_whatsapp(phone, clean_msg)
+
+        # 5. סגירת הזמנה חדשה
         elif "FINAL_ORDER|" in bot_reply:
-            parts     = bot_reply.split("|")
-            clean_msg = split_msg = bot_reply.split("FINAL_ORDER|")[0].strip()
-            if len(parts) >= 6:
-                name       = parts[2].strip()
-                address    = parts[3].strip()
-                items      = parts[4].strip()
-                order_type = parts[5].strip()
+            clean_msg = bot_reply.split("FINAL_ORDER|")[0].strip()
+            parts = bot_reply.split("FINAL_ORDER|")[1].split("|")
+            try:
+                name       = parts[1].strip() if len(parts) > 1 else "לקוח"
+                address    = parts[2].strip() if len(parts) > 2 else "איסוף"
+                items      = parts[3].strip() if len(parts) > 3 else "מוצרים"
+                order_type = parts[4].strip() if len(parts) > 4 else "לא צוין"
 
                 if not name or len(name) < 2 or "[שם]" in name:
-                    send_whatsapp(phone, "אופס, לא קלטתי את השם. איך קוראים לך? 😊")
+                    send_whatsapp(phone, "רגע נשמה, לא קלטתי טוב את השם שלך. איך קוראים לך כדי שאוכל לרשום את זה? 😊")
                 else:
                     order_id = save_order(name, phone, address, items, order_type)
                     if order_id:
                         if "איסוף" in order_type.lower():
-                            msg = f"פרפקט {name}! הזמנה #{order_id} התקבלה 📦\nמתחילים לארוז — נעדכן מתי לבוא 🛒\n\n💡 שכחת משהו? רוצה לשנות משהו? פשוט כתוב לי!"
+                            msg = f"אש עליך {name}! הזמנה #{order_id} נשמרה בהצלחה 📦\nהצוות כבר מתחיל לארוז אותה — נעדכן אותך כאן ברגע שהכל מוכן ומחכה לך בחנות! 🛒"
                         else:
-                            msg = f"יופי {name}! הזמנה #{order_id} הועברה לבוס ⏳\nנעדכן כשהמשלוח ייצא 🛵\n\n💡 שכחת לציין מספר דירה? רוצה לשנות כתובת? פשוט כתוב לי!"
+                            msg = f"מעולה {name}! הזמנה #{order_id} הועברה ישירות לבוס לאישור ⏳\nנשלח לך הודעה ברגע שהשליח יוצא לכיוון הכתובת שלך! 🛵"
                         
-                        if clean_msg:
-                            send_whatsapp(phone, clean_msg)
+                        if clean_msg: send_whatsapp(phone, clean_msg)
                         send_whatsapp(phone, msg)
                         clear_history(phone)
                     else:
-                        send_whatsapp(phone, "אופס, הייתה בעיה טכנית. נסה שוב? 🙏")
+                        send_whatsapp(phone, "אופס, הייתה בעיה קטנה בשמירת ההזמנה במסד הנתונים. תוכל לנסות לאשר שוב? 🙏")
+            except Exception as e:
+                log.error("Fail to parse FINAL_ORDER: %s", e)
+                send_whatsapp(phone, "ההזמנה נקלטה, אך חסרים פרטים. בוא נעשה סדר קטן!")
 
-        # ── תשובה רגילה ──
+        # 6. שיחה רגילה
         else:
             clean_reply = (
                 bot_reply
@@ -701,7 +701,7 @@ def process_messages(phone: str) -> None:
 
     except Exception as e:
         log.error("process_messages AI error for %s: %s", phone, e)
-        send_whatsapp(phone, "סליחה, יש לי בעיה טכנית קטנה. נסה שוב בעוד שנייה 😊")
+        send_whatsapp(phone, "סליחה, יש לי עומס קטן במערכת. תוכל לכתוב לי שוב בעוד שנייה? 😊")
 
 
 # ─────────────────────────────────────────────
@@ -740,7 +740,7 @@ def receive_message():
                     # ── חסימת הודעות קוליות / מדיה ──
                     if msg_type in ['audio', 'image', 'video', 'document', 'sticker']:
                         log.info("Blocked media msg from %s", sender)
-                        send_whatsapp(sender, "סליחה, אני בוט ולא יודע לראות תמונות או לשמוע הודעות קוליות. אפשר לכתוב לי במילים? 🙏")
+                        send_whatsapp(sender, "סליחה, אני בוט ואני עדיין לא יודע לראות תמונות או לשמוע הודעות קוליות. תוכל לכתוב לי את זה במילים? 🙏")
                         continue
                         
                     if msg_type != 'text':
@@ -777,7 +777,7 @@ def home():
     return jsonify({
         "status":  "running",
         "service": "WhatsApp Bot — המכולת של הצדיק",
-        "version": "6.5"
+        "version": "7.0"
     })
 
 
