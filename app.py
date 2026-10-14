@@ -48,22 +48,33 @@ def is_message_processed(message_id: str) -> bool:
     try:
         conn = get_conn()
         cur = conn.cursor()
+        
+        # בדיקה האם המזהה כבר קיים בטבלה
+        cur.execute("SELECT 1 FROM processed_messages WHERE message_id = %s", (message_id,))
+        exists = cur.fetchone()
+        
+        if exists:
+            cur.close()
+            return True # ההודעה כבר קיימת, היא אכן עובדה בעבר
+            
+        # אם היא לא קיימת, נשמור אותה עכשיו כדי שלא תטופל שוב במקביל
         cur.execute(
-            "INSERT INTO processed_messages (message_id) VALUES (%s) ON CONFLICT (message_id) DO NOTHING RETURNING id",
+            "INSERT INTO processed_messages (message_id) VALUES (%s) ON CONFLICT (message_id) DO NOTHING",
             (message_id,)
         )
-        inserted = cur.fetchone()
         conn.commit()
         cur.close()
-        return inserted is None
+        return False # הודעה חדשה, היא לא עובדה עדיין
+        
     except Exception as e:
         log.error("is_message_processed error: %s", e)
         if conn:
             conn.rollback()
-        return True
+        return False # במקרה של שגיאת תקשורת, אל תחסום את הבוט! תן לו לנסות לענות.
     finally:
         if conn:
             release_conn(conn)
+
 
 
 def save_message(phone: str, role: str, content: str) -> None:
